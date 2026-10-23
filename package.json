@@ -1,0 +1,14 @@
+{
+  "name": "sonicwave-ai-song",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "免登录的 AI 歌曲生成网页（免费公共算力）",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "engines": {
+    "node": ">=22 <26"
+  }
+}

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: sonicwave
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.mjs
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 24.22.1
+      # 公网部署强烈建议设置；Render 创建时会提示你输入
+      - key: ACCESS_PASSWORD
+        sync: false

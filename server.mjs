@@ -1,0 +1,1600 @@
+/* 声浪 · 免费 AI 歌曲生成 —— 零依赖 Node 后端
+ *
+ * 音乐生成：MiniMax Music 3 官方 Hugging Face Space（匿名、免费）
+ * 歌词创作：Pollinations 免费文本接口（匿名）
+ *
+ * 本服务只做三件事：代理跨域请求、把 Gradio 事件流转成 SSE、缓存生成的 WAV。
+ */
+import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { execSync, execFileSync, spawn } from 'node:child_process';
+import os from 'node:os';
+import dns from 'node:dns';
+
+// 优先 IPv4：部分网络环境会先解析到不可用的 IPv6，导致 TLS 握手被重置
+dns.setDefaultResultOrder('ipv4first');
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
+const AUDIO_DIR = path.join(CACHE_DIR, 'audio');
+fs.mkdirSync(AUDIO_DIR, { recursive: true });
+
+// 注意：很多环境会预置 PORT，容易冲突，这里用独立变量
+// Render 会注入 RENDER=true 和 PORT，并要求监听 0.0.0.0
+const IS_RENDER = process.env.RENDER === 'true' || Boolean(process.env.RENDER_SERVICE_ID);
+const PORT = Number(process.env.SONICWAVE_PORT) || (IS_RENDER ? Number(process.env.PORT) || 10000 : 8899);
+const HOST = process.env.HOST || (IS_RENDER ? '0.0.0.0' : '127.0.0.1');
+const ACCESS_PASSWORD = (process.env.ACCESS_PASSWORD || '').trim();
+const SPACE = 'https://minimaxai-minimax-music3.hf.space';
+const POLLINATIONS = 'https://text.pollinations.ai';
+const MINIMAX_BASE = (process.env.MINIMAX_BASE || 'https://api.minimax.cn').replace(/\/+$/, '');
+const MINIMAX_MODEL = process.env.MINIMAX_MODEL || 'music-3.0-free';
+const MINIMAX_MODELS = ['music-3.0-free', 'music-2.6-free', 'music-3.0', 'music-2.6'];
+const MM_WEB_TOKEN = (process.env.MM_WEB_TOKEN || '').trim();
+const MM_WEB_OP_TICKET = (process.env.MM_WEB_OP_TICKET || '').trim();
+const MM_WEB_BASE = 'https://www.minimax.cn';
+const MM_WEB_MODELS = ['music-3.0', 'music-2.6'];
+const MINIMAX_KEY = (process.env.MINIMAX_API_KEY || '').trim();
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 2;
+const MAX_DURATION = 180;
+const MIN_DURATION = 30;
+const MAX_LIVE_CHUNK_BYTES = 64 * 1024 * 1024;
+const DEFAULT_HF_TOKEN = (process.env.HF_TOKEN || '').trim();
+const JOB_TTL_MS = 45 * 60 * 1000;
+
+const log = (...a) => console.log('[声浪]', new Date().toLocaleTimeString('zh-CN'), ...a);
+
+/* ------------------------------------------------------------------ *
+ * 网络层：支持 HTTP 代理（环境变量或 Windows 系统代理），失败自动直连
+ * ------------------------------------------------------------------ */
+function proxyFromEnv() {
+  const raw = process.env.HTTPS_PROXY || process.env.https_proxy
+    || process.env.HTTP_PROXY || process.env.http_proxy
+    || process.env.ALL_PROXY || process.env.all_proxy;
+  if (!raw) return null;
+  if (/^socks/i.test(raw)) return null;
+  try {
+    const u = new URL(raw.includes('://') ? raw : `http://${raw}`);
+    return { host: u.hostname, port: Number(u.port) || 80 };
+  } catch { return null; }
+}
+
+function proxyFromRegistry() {
+  if (process.platform !== 'win32') return null;
+  try {
+    const out = execSync(
+      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"',
+      { encoding: 'utf8', windowsHide: true, timeout: 5000 }
+    );
+    if (!/ProxyEnable\s+REG_DWORD\s+0x1/i.test(out)) return null;
+    const m = out.match(/ProxyServer\s+REG_SZ\s+([^\r\n]+)/i);
+    if (!m) return null;
+    let server = m[1].trim();
+    if (server.includes('=')) {
+      const parts = Object.fromEntries(server.split(';').filter(Boolean).map(s => s.split('=')));
+      server = parts.https || parts.http || '';
+    }
+    const [host, port] = server.replace(/^https?:\/\//, '').split(':');
+    if (!host) return null;
+    return { host, port: Number(port) || 80 };
+  } catch { return null; }
+}
+
+const PROXY_OFF = /^(off|0|false|no)$/i.test(process.env.PROXY || '');
+const ENV_PROXY = proxyFromEnv();
+const REGISTRY_PROXY = proxyFromRegistry();
+let PROXY = PROXY_OFF ? null : (ENV_PROXY || REGISTRY_PROXY || null);
+// 代理偶尔会抖，不能一次失败就永久放弃：短暂退避后继续尝试
+let proxyFailCount = 0;
+let proxyBackoffUntil = 0;
+let lastProxyProbe = Date.now();
+const proxyReady = () => Boolean(PROXY) && Date.now() >= proxyBackoffUntil;
+
+// 系统代理开关是用户随时会动的，定时重新探测（环境变量优先，不动）
+function refreshProxy() {
+  if (PROXY_OFF || ENV_PROXY) return;
+  if (Date.now() - lastProxyProbe < 60000) return;
+  lastProxyProbe = Date.now();
+  const next = proxyFromRegistry();
+  if (next && (!PROXY || next.host !== PROXY.host || next.port !== PROXY.port)) {
+    PROXY = next;
+    proxyFailCount = 0;
+    proxyBackoffUntil = 0;
+    log(`检测到系统代理 ${next.host}:${next.port}`);
+  }
+}
+
+function openTunnel(proxy, targetHost, targetPort, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: proxy.host,
+      port: proxy.port,
+      method: 'CONNECT',
+      path: `${targetHost}:${targetPort}`,
+      headers: { Host: `${targetHost}:${targetPort}` },
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('代理连接超时')));
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        return reject(new Error(`代理 CONNECT 失败 (${res.statusCode})`));
+      }
+      const tlsSock = tls.connect({ socket, servername: targetHost });
+      tlsSock.once('error', reject);
+      tlsSock.once('secureConnect', () => resolve(tlsSock));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+class SocketAgent extends https.Agent {
+  constructor(socket) {
+    super({ keepAlive: false });
+    this.socket = socket;
+  }
+  createConnection(options, cb) {
+    cb(null, this.socket);
+  }
+}
+
+const PROXY_PORTS = [7890, 7897, 10809, 10808, 8888, 1080, 8080, 20171];
+const PROXY_CACHE_FILE = path.join(CACHE_DIR, 'proxy.json');
+
+function loadCachedProxy() {
+  try {
+    const p = JSON.parse(fs.readFileSync(PROXY_CACHE_FILE, 'utf8'));
+    if (p && p.port) return { host: p.host || '127.0.0.1', port: Number(p.port) };
+  } catch { /* 没有缓存 */ }
+  return null;
+}
+
+function rememberProxy(p) {
+  try { fs.writeFileSync(PROXY_CACHE_FILE, JSON.stringify({ host: p.host, port: p.port })); } catch {}
+}
+
+// 上次成功用过的代理，下次启动直接复用（失败会自动重新探测）
+if (!PROXY && !PROXY_OFF && !IS_RENDER) PROXY = loadCachedProxy();
+
+function useProxy(p, reason) {
+  if (PROXY && PROXY.host === p.host && PROXY.port === p.port) return;
+  PROXY = p;
+  proxyFailCount = 0;
+  proxyBackoffUntil = 0;
+  rememberProxy(p);
+  log(`${reason}：使用代理 ${p.host}:${p.port}`);
+}
+
+let proxyProbe = null;
+let lastProbeAt = 0;
+/** 探测本机常见代理端口（只做 CONNECT，不握手），用于系统代理关闭但代理仍在运行的场景 */
+function probeLocalProxies(host = 'huggingface.co') {
+  if (IS_RENDER) return Promise.resolve(null); // 云上没有本机代理
+  if (proxyProbe) return proxyProbe;
+  if (Date.now() - lastProbeAt < 20000) return Promise.resolve(null);
+  lastProbeAt = Date.now();
+  proxyProbe = (async () => {
+    for (const port of PROXY_PORTS) {
+      if (PROXY && PROXY.host === '127.0.0.1' && PROXY.port === port) continue;
+      try {
+        const sock = await openTunnel({ host: '127.0.0.1', port }, host, 443, 1500);
+        sock.destroy();
+        return { host: '127.0.0.1', port };
+      } catch { /* 该端口不可用 */ }
+    }
+    return null;
+  })().finally(() => { proxyProbe = null; });
+  return proxyProbe;
+}
+
+function attemptViaProxy(proxy, url, method, headers, body, timeout) {
+  return openTunnel(proxy, url.hostname, Number(url.port) || 443, 8000).then(stream =>
+    new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: url.hostname,
+        port: url.port || 443,
+        method,
+        path: url.pathname + url.search,
+        headers,
+        agent: new SocketAgent(stream),
+      }, res => {
+        proxyFailCount = 0;
+        proxyBackoffUntil = 0;
+        resolve(res);
+      });
+      req.setTimeout(timeout || 0, () => req.destroy(new Error('请求超时')));
+      req.on('error', reject);
+      if (body != null) req.write(body);
+      req.end();
+    })
+  );
+}
+
+function attemptDirect(url, method, headers, body, timeout) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: url.hostname,
+      port: url.port || 443,
+      family: 4,
+      method,
+      path: url.pathname + url.search,
+      headers,
+      timeout: timeout || 0,
+    }, res => resolve(res));
+    req.on('timeout', () => req.destroy(new Error('请求超时')));
+    req.on('error', reject);
+    if (body != null) req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * 发起 HTTPS 请求，返回 IncomingMessage。
+ * 顺序：当前代理 → 直连 → 重试代理 → 探测本机代理端口。
+ * 很多网络环境下直连会被 DNS 污染，代理才是唯一通路。
+ */
+/* ------------------------------------------------------------------ *
+ * curl 传输层
+ * 国内网络下 Node(OpenSSL) 的 TLS 握手经常被重置，系统自带的 curl
+ * （Windows Schannel / macOS SecureTransport）要稳得多，因此优先用 curl。
+ * ------------------------------------------------------------------ */
+let CURL_BIN; // undefined=未检测, null=不可用
+function detectCurl() {
+  if (CURL_BIN !== undefined) return CURL_BIN;
+  try {
+    const out = execFileSync('curl', ['--version'], { encoding: 'utf8', timeout: 4000, windowsHide: true });
+    CURL_BIN = /^curl /m.test(out) ? 'curl' : null;
+  } catch {
+    CURL_BIN = null;
+  }
+  return CURL_BIN;
+}
+
+function parseHttpHeader(text) {
+  const blocks = String(text).split(/\r?\n\r?\n/).filter(Boolean);
+  let status = 0;
+  let headers = {};
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    const m = /^HTTP\/[\d.]+\s+(\d{3})/.exec(lines[0] || '');
+    if (!m) continue;
+    status = Number(m[1]);
+    headers = {};
+    for (const line of lines.slice(1)) {
+      const idx = line.indexOf(':');
+      if (idx > 0) headers[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+    }
+  }
+  return { status, headers };
+}
+
+function curlRequest(urlStr, { method = 'GET', headers = {}, body = null, timeout = 60000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const headerFile = path.join(os.tmpdir(), `sonicwave-h-${crypto.randomBytes(6).toString('hex')}`);
+    const args = ['-sS', '-N', '--http1.1', '--connect-timeout', '15', '-D', headerFile, '-X', method];
+    if (timeout) args.push('--max-time', String(Math.ceil(timeout / 1000) + 5));
+    if (PROXY && proxyReady()) args.push('-x', `http://${PROXY.host}:${PROXY.port}`);
+    for (const [k, v] of Object.entries(headers)) {
+      const key = k.toLowerCase();
+      if (key === 'host' || key === 'content-length') continue; // 交给 curl 计算
+      args.push('-H', `${k}: ${v}`);
+    }
+    if (body != null) args.push('--data-binary', '@-');
+    args.push(urlStr);
+
+    let child;
+    try {
+      child = spawn(CURL_BIN || 'curl', args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) {
+      return reject(e);
+    }
+
+    const out = child.stdout;
+    out.pause();
+    // 防止在调用方尚未挂监听时（超时/取消）产生未捕获的 stream error
+    out.on('error', () => {});
+    child.stdin.on('error', () => {});
+    let stderr = '';
+    let done = false;
+    let poll = null;
+    let hard = null;
+    const cleanup = () => { try { fs.unlinkSync(headerFile); } catch {} };
+    const attach = (status, hdrs) => {
+      out.statusCode = status;
+      out.headers = hdrs;
+      const origDestroy = out.destroy.bind(out);
+      out.destroy = (err) => { try { child.kill(); } catch {} return origDestroy(err); };
+    };
+    const finish = (err, res) => {
+      if (done) return;
+      done = true;
+      clearInterval(poll);
+      clearTimeout(hard);
+      if (err) { try { child.kill(); } catch {} cleanup(); reject(err); return; }
+      resolve(res); // 不解流，交给消费方 on('data')/pipe 自动恢复
+    };
+
+    poll = setInterval(() => {
+      let text = '';
+      try { text = fs.readFileSync(headerFile, 'latin1'); } catch { return; }
+      if (!/\r?\n\r?\n\s*$/.test(text)) return;
+      const { status, headers: hdrs } = parseHttpHeader(text);
+      if (!status || status === 100) return;
+      attach(status, hdrs);
+      finish(null, out);
+    }, 20);
+
+    hard = setTimeout(() => finish(new Error('请求超时')), timeout ? timeout + 8000 : 20 * 60 * 1000);
+
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('error', err => finish(err));
+    child.on('exit', code => {
+      if (!done) {
+        let text = '';
+        try { text = fs.readFileSync(headerFile, 'latin1'); } catch {}
+        const { status, headers: hdrs } = text ? parseHttpHeader(text) : { status: 0, headers: {} };
+        if (status) { attach(status, hdrs); finish(null, out); }
+        else finish(new Error(stderr.trim() || `curl 退出码 ${code}`));
+      } else if (code !== 0) {
+        out.destroy(new Error(stderr.trim() || `curl 退出码 ${code}`));
+      }
+      cleanup();
+    });
+
+    if (body != null) child.stdin.end(body); else child.stdin.end();
+  });
+}
+
+async function nodeRequest(urlStr, { method = 'GET', headers = {}, body = null, timeout = 60000 } = {}) {
+  refreshProxy();
+  const url = new URL(urlStr);
+  const finalHeaders = { 'user-agent': 'SonicWave/1.0 (+local)', 'accept-encoding': 'identity', ...headers };
+  if (body != null && finalHeaders['content-length'] == null && finalHeaders['Content-Length'] == null) {
+    finalHeaders['content-length'] = Buffer.byteLength(body);
+  }
+
+  const errors = [];
+
+  if (PROXY && proxyReady()) {
+    try {
+      return await attemptViaProxy(PROXY, url, method, finalHeaders, body, timeout);
+    } catch (err) {
+      errors.push(err);
+      proxyFailCount++;
+      proxyBackoffUntil = Date.now() + (proxyFailCount >= 2 ? 60000 : 8000);
+      log(`代理请求失败（第 ${proxyFailCount} 次）：${err.message}`);
+    }
+  }
+
+  try {
+    return await attemptDirect(url, method, finalHeaders, body, timeout);
+  } catch (err) {
+    errors.push(err);
+  }
+
+  // 直连失败：可能只是暂时退避，或系统代理没开但代理还在跑
+  if (PROXY && !proxyReady()) {
+    try {
+      return await attemptViaProxy(PROXY, url, method, finalHeaders, body, timeout);
+    } catch (err) { errors.push(err); }
+  }
+
+  const probed = await probeLocalProxies(url.hostname);
+  if (probed) {
+    try {
+      const res = await attemptViaProxy(probed, url, method, finalHeaders, body, timeout);
+      useProxy(probed, '自动探测到本机代理');
+      return res;
+    } catch (err) { errors.push(err); }
+  }
+
+  throw errors[0] || new Error('网络连接失败');
+}
+
+async function request(urlStr, opts = {}) {
+  refreshProxy();
+  if (detectCurl()) {
+    try {
+      return await curlRequest(urlStr, opts);
+    } catch (err) {
+      log('curl 传输失败，改用 Node：' + err.message);
+    }
+  }
+  return nodeRequest(urlStr, opts);
+}
+
+async function requestFollow(urlStr, opts = {}, depth = 0) {
+  const res = await request(urlStr, opts);
+  if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && depth < 5) {
+    res.resume();
+    return requestFollow(new URL(res.headers.location, urlStr).toString(), opts, depth + 1);
+  }
+  return res;
+}
+
+function readBody(res, limit = 4 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const parts = [];
+    let size = 0;
+    res.on('data', d => {
+      size += d.length;
+      if (size > limit) { res.destroy(new Error('响应过大')); return; }
+      parts.push(d);
+    });
+    res.on('end', () => resolve(Buffer.concat(parts).toString('utf8')));
+    res.on('error', reject);
+  });
+}
+
+async function fetchJson(urlStr, opts = {}, limit) {
+  const res = await requestFollow(urlStr, opts);
+  const text = await readBody(res, limit);
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    throw new Error(`上游 ${res.statusCode}: ${text.slice(0, 300)}`);
+  }
+  try { return JSON.parse(text); }
+  catch { throw new Error('上游返回了非 JSON 内容: ' + text.slice(0, 200)); }
+}
+
+/* ------------------------------------------------------------------ *
+ * 歌词创作（Pollinations，匿名免费）
+ * ------------------------------------------------------------------ */
+const LYRICS_SYSTEM = `你是顶尖的中文流行作词人。根据用户描述写一首可以演唱的完整歌词。
+
+只输出一个 JSON 对象，不要 Markdown 代码块，不要解释。格式：
+{"title":"歌名","lyrics":"歌词","style":"英文风格标签"}
+
+要求：
+- lyrics 使用 [Verse] [Chorus] [Bridge] [Outro] 等段落标签（标签单独占一行），每行一句，共 12~24 行；副歌要重复、抓耳；有画面感和具体细节。
+- 段落数量随目标时长调整：30 秒以内写一个主歌加一个副歌；约 60 秒写主歌-副歌-主歌-副歌；120 秒以上再加 Bridge 和 Outro。
+- 语言与用户描述一致（中文描述写中文词）。
+- style 用英文逗号分隔的标签，包含曲风、人声类型/性别、主要乐器、情绪、BPM，例如 "mandopop, warm female vocal, acoustic guitar, nostalgic, 92 BPM"。
+- instrumental 为 true 时，lyrics 只写 "[instrumental]"。`;
+
+function stripJson(text) {
+  if (!text) return null;
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const source = fenced ? fenced[1] : text;
+  const start = source.indexOf('{');
+  const end = source.lastIndexOf('}');
+  if (start === -1 || end <= start) return null;
+  try { return JSON.parse(source.slice(start, end + 1)); } catch { return null; }
+}
+
+// 模型偶尔会漏转义引号/换行，尽力把字段抠出来
+function lenientExtract(text) {
+  const t = String(text || '');
+  const title = (t.match(/"title"\s*:\s*"([^"]*)"/) || [])[1] || '';
+  const style = (t.match(/"style"\s*:\s*"([^"]*)"/) || [])[1] || '';
+  const lm = t.match(/"lyrics"\s*:\s*"([\s\S]*?)"\s*(?:,\s*"style"|\})/);
+  if (!lm) return null;
+  const lyrics = lm[1]
+    .replace(/\\r/g, '')
+    .replace(/\\n/g, '\n')
+    .replace(/\\"/g, '"')
+    .replace(/\\t/g, '\t');
+  return { title, lyrics, style };
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function writeLyrics({ description, style, instrumental, duration }) {
+  const desc = String(description || '').trim().slice(0, 600);
+  const baseUser = [
+    `歌曲描述：${desc}`,
+    style ? `指定风格：${String(style).slice(0, 240)}` : '',
+    `目标时长：约 ${duration || 60} 秒`,
+    `纯音乐：${instrumental ? '是' : '否'}`,
+    '请直接输出 JSON。',
+  ].filter(Boolean).join('\n');
+
+  let lastRaw = '';
+  let lastError = '';
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await sleep(1200 * attempt);
+
+    const user = attempt === 0
+      ? baseUser
+      : `${baseUser}\n\n注意：上一次的回复不是合法 JSON。这次请严格只输出 {"title":"...","lyrics":"...","style":"..."}，不要任何解释，歌词里的换行写 \\n。`;
+
+    const payload = JSON.stringify({
+      model: 'openai-fast',
+      messages: [
+        { role: 'system', content: LYRICS_SYSTEM },
+        { role: 'user', content: user },
+      ],
+      temperature: 0.9 + attempt * 0.05,
+      max_tokens: 1400,
+    });
+
+    try {
+      const res = await requestFollow(`${POLLINATIONS}/openai`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: payload,
+        timeout: 100000,
+      });
+      if (res.statusCode !== 200) {
+        lastRaw = (await readBody(res).catch(() => '')).slice(0, 200);
+        lastError = `写词服务返回 ${res.statusCode}`;
+        log(`写词第 ${attempt + 1} 次失败：HTTP ${res.statusCode}`);
+        continue;
+      }
+      const text = await readBody(res, 2 * 1024 * 1024);
+      let content = '';
+      try {
+        const msg = JSON.parse(text)?.choices?.[0]?.message || {};
+        // 推理模型有时把结果全放在 reasoning 里，content 为空
+        content = String(msg.content || '').trim() || String(msg.reasoning || '');
+      } catch { content = text; }
+      lastRaw = String(content || '').slice(0, 400);
+
+      let data = stripJson(content);
+      if (!data) data = lenientExtract(content);
+      if (!data) {
+        // 模型把歌词当普通文本写了出来的兜底
+        const prose = String(content).trim();
+        if (prose.length > 40 && /\[(verse|chorus|bridge|intro|outro)/i.test(prose)) {
+          data = { lyrics: prose };
+        }
+      }
+
+      const lyrics = String(data?.lyrics || '').trim();
+      if (lyrics.length >= 40) {
+        return {
+          title: String(data.title || '').trim().slice(0, 40) || desc.slice(0, 16) || '未命名作品',
+          lyrics: lyrics.slice(0, 8000),
+          style: String(data.style || style || 'pop, warm production, 100 BPM').trim().slice(0, 300),
+        };
+      }
+      log(`写词第 ${attempt + 1} 次结果不可用，重试…`);
+    } catch (e) {
+      lastError = e.message;
+      log(`写词第 ${attempt + 1} 次异常：${e.message}`);
+    }
+  }
+
+  log('写词最终失败，最后一次返回：', lastRaw.replace(/\s+/g, ' ').slice(0, 160));
+  throw new Error(lastError || '写词服务暂时没有给出可用歌词');
+}
+
+/* ------------------------------------------------------------------ *
+ * 引擎 C：MiniMax 网页登录态（非官方接口）
+ * 网页端用 WebSocket + 签名访问，签名算法：
+ *   yy = md5(encodeURIComponent(path+query) + "_" + "{}" + md5(unix) + "ooui")
+ * ------------------------------------------------------------------ */
+const md5 = value => crypto.createHash('md5').update(String(value), 'utf8').digest('hex');
+
+function jwtPayload(token) {
+  try {
+    const part = String(token).split('.')[1] || '';
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+  } catch { return {}; }
+}
+
+function webClientUuid() {
+  const file = path.join(CACHE_DIR, 'web-client.json');
+  try {
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (saved.uuid) return saved.uuid;
+  } catch { /* 首次运行 */ }
+  const uuid = crypto.randomUUID();
+  try { fs.writeFileSync(file, JSON.stringify({ uuid })); } catch {}
+  return uuid;
+}
+
+function webSignedPath(pathname, token, extra = {}) {
+  const t = Date.now();
+  const payload = jwtPayload(token);
+  const deviceId = payload?.user?.deviceID || payload?.deviceID || '';
+  const params = new URLSearchParams({
+    device_platform: 'web', app_id: '3001', version_code: '22201', biz_id: '1',
+    uuid: webClientUuid(), lang: 'zh-Hans',
+    os_name: 'Windows', browser_name: 'chrome',
+    device_memory: '16', cpu_core_num: '16',
+    browser_language: 'zh-CN', browser_platform: 'Win32',
+    screen_width: '1536', screen_height: '864', unix: String(t),
+  });
+  if (deviceId) params.set('device_id', String(deviceId));
+  for (const [k, v] of Object.entries(extra)) params.set(k, String(v));
+  const full = pathname + '?' + params.toString();
+  const yy = md5(encodeURIComponent(full) + '_' + '{}' + md5(String(t)) + 'ooui');
+  return { path: full, yy };
+}
+
+async function webGet(pathname, token, extra = {}) {
+  const { path: signedPath, yy } = webSignedPath(pathname, token, extra);
+  const res = await requestFollow(MM_WEB_BASE + signedPath, {
+    headers: {
+      token,
+      yy,
+      accept: 'application/json, text/plain, */*',
+      referer: 'https://www.minimax.cn/audio/music',
+    },
+    timeout: 30000,
+  });
+  const text = await readBody(res, 8 * 1024 * 1024);
+  if (res.statusCode !== 200) throw new Error(`网页接口 ${res.statusCode}`);
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error('网页接口返回了非 JSON'); }
+  if (data?.statusInfo?.code) {
+    throw new Error(`MiniMax web ${data.statusInfo.code}: ${data.statusInfo.message || ''}`);
+  }
+  return data?.data;
+}
+
+function webWsUrl(token) {
+  const { path: signedPath, yy } = webSignedPath('/v1/api/music/ws', token);
+  return `wss://www.minimax.cn${signedPath}&yy=${encodeURIComponent(yy)}&token=${encodeURIComponent(token)}&op_ticket=${encodeURIComponent(MM_WEB_OP_TICKET)}`;
+}
+
+function pickWebToken(raw) {
+  const token = String(raw || '').trim();
+  if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token)) return token;
+  return MM_WEB_TOKEN;
+}
+
+function webModelFor(selected) {
+  const model = String(selected || '').replace(/-free$/i, '');
+  return MM_WEB_MODELS.includes(model) ? model : 'music-3.0';
+}
+
+/* ---------- 引擎 C：网页登录态任务 ---------- */
+async function runWebJob(job) {
+  let ws = null;
+  let timer = null;
+  try {
+    const input = job.input;
+    const token = job.mmWebToken;
+    const model = webModelFor(input.minimaxModel);
+    if (!token) throw new Error('没有网页登录态 Token');
+    if (typeof WebSocket === 'undefined') throw new Error('当前 Node 版本不支持内置 WebSocket，请升级到 Node 22+');
+
+    setStage(job, 'submitting', '正在连接 MiniMax 网页接口…');
+    ws = new WebSocket(webWsUrl(token));
+    job.webSocket = ws;
+    const msgId = crypto.randomUUID();
+
+    const answer = await new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (fn, arg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn(arg);
+      };
+      timer = setTimeout(() => done(reject, new Error('网页接口超时（15 分钟）')), 15 * 60 * 1000);
+
+      ws.addEventListener('open', () => {
+        if (job.canceled) return;
+        setStage(job, 'generating', '网页版模型正在谱曲演唱，通常 3~8 分钟…', { progress: 0.08 });
+        job.status = 'generating';
+        const ideaText = [input.style, input.description]
+          .filter(Boolean).join('，').replace(/\s+/g, ' ').slice(0, 1000) || 'pop music, warm vocal';
+        const payLoad = {
+          model,
+          generation_type: 1,
+          idea: ideaText,
+          n: 1,
+          stream: true,
+          rewrite_idea_switch: false,
+        };
+        if (input.title) payLoad.title = input.title;
+        if (input.lyrics && !/^\[instrumental\]$/i.test(input.lyrics)) payLoad.lyrics = input.lyrics.slice(0, 3500);
+        if (input.instrumental) payLoad.instrumental = true;
+        ws.send(JSON.stringify({ method: 'MusicGen', music_payLoad: payLoad, msg_id: msgId }));
+      });
+
+      ws.addEventListener('message', (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+        if (msg.method === 'Heartbeat') {
+          try { ws.send(JSON.stringify({ method: 'Heartbeat', msg_id: msg.msg_id, timestamp: Date.now() })); } catch {}
+          return;
+        }
+        if (msg.method === 'Close') {
+          done(reject, new Error('网页接口关闭了连接'));
+          return;
+        }
+        if (msg.statusInfo && msg.statusInfo.code !== 0) {
+          done(reject, new Error(`MiniMax web ${msg.statusInfo.code}: ${msg.statusInfo.message || ''}`));
+          return;
+        }
+        if (msg.input_sensitive) {
+          done(reject, new Error('输入内容触发了平台审核，请换个描述'));
+          return;
+        }
+        if (Array.isArray(msg.data)) {
+          for (const item of msg.data) {
+            if (item.music_id) job.musicId = item.music_id;
+            if (item.status === 2 && item.audio_url) { done(resolve, item); return; }
+            if (item.status >= 3) { done(reject, new Error(`网页生成失败（状态 ${item.status}）`)); return; }
+          }
+        }
+        if (msg.ended) done(resolve, (msg.data || [])[0] || null);
+      });
+
+      ws.addEventListener('error', () => { /* close 事件会兜底 */ });
+      ws.addEventListener('close', (e) => {
+        if (!settled) done(reject, new Error(`网页接口断开（${e.code}）`));
+      });
+    });
+
+    if (job.canceled) return;
+    try { ws.close(); } catch {}
+
+    let item = answer;
+    if (!item?.audio_url) {
+      const history = await webGet('/v1/api/music/history_list', token, { page: 1, page_size: 10 });
+      const list = history?.music_list || [];
+      item = list.find(x => x.music_id === job.musicId) || list[0];
+    }
+    if (!item?.audio_url) throw new Error('网页接口没有返回可下载的音频');
+
+    setStage(job, 'downloading', '生成完成，正在保存音频…', { progress: 0.96 });
+    const target = path.join(AUDIO_DIR, `${job.id}.mp3`);
+    await downloadToFile(item.audio_url, target);
+    const stat = await fsp.stat(target);
+    if (!stat.size) throw new Error('保存的音频为空');
+
+    const duration = item.duration
+      ? Math.max(1, Math.round(item.duration / 1000))
+      : Math.max(1, Math.round((stat.size * 8) / 256000));
+
+    const meta = baseMeta(job, {
+      duration,
+      requestedDuration: input.duration,
+      audio: `/api/audio/${job.id}.mp3`,
+      format: 'mp3',
+      bytes: stat.size,
+      model: item.model || model,
+      coverUrl: item.cover_url || '',
+    });
+    await completeJob(job, meta);
+  } catch (err) {
+    try { ws?.close(); } catch {}
+    failJob(job, err);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * 任务：提交 Gradio → 消费 SSE → 下载 WAV
+ * ------------------------------------------------------------------ */
+const jobs = new Map();
+const queue = [];
+let running = 0;
+
+function sseSend(res, obj) {
+  res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+function broadcast(job, obj) {
+  if (obj.type === 'chunk') job.lastSeq = obj.seq;
+  for (const client of job.clients) {
+    try { sseSend(client, obj); } catch { job.clients.delete(client); }
+  }
+}
+
+function setStage(job, stage, message, extra = {}) {
+  job.stage = stage;
+  job.message = message;
+  Object.assign(job, extra);
+  broadcast(job, { type: 'status', stage, message, progress: job.progress, ...extra });
+  log(`[${job.id.slice(0, 6)}] ${message}`);
+}
+
+function setProgress(job, ratio, seconds) {
+  const p = Math.max(0, Math.min(1, ratio));
+  if (p - job.progress < 0.003 && p < 1) return;
+  job.progress = p;
+  if (seconds != null) job.seconds = seconds;
+  broadcast(job, { type: 'progress', progress: p, seconds: job.seconds, duration: job.duration });
+}
+
+function createJob(input, hfToken = '', minimaxKey = '', minimaxModel = MINIMAX_MODEL, mmWebToken = '') {
+  const id = crypto.randomBytes(8).toString('hex');
+  const job = {
+    id,
+    createdAt: Date.now(),
+    status: 'queued',
+    stage: 'queued',
+    message: '排队中…',
+    progress: 0,
+    seconds: 0,
+    duration: input.duration,
+    chunks: [],
+    chunkBytes: 0,
+    lastSeq: 0,
+    clients: new Set(),
+    canceled: false,
+    hfToken,
+    minimaxKey,
+    minimaxModel,
+    mmWebToken,
+    engine: mmWebToken ? 'web' : (minimaxKey ? 'minimax' : 'hf'),
+    input,
+    wavUrl: null,
+    audioUrl: null,
+    error: null,
+  };
+  jobs.set(id, job);
+  return job;
+}
+
+function pump() {
+  while (running < MAX_CONCURRENT && queue.length) {
+    const job = queue.shift();
+    if (job.canceled) continue;
+    running++;
+    runJob(job).finally(() => { running--; pump(); });
+  }
+}
+
+function enqueue(job) {
+  queue.push(job);
+  pump();
+}
+
+async function runJob(job) {
+  if (job.engine === 'web') return runWebJob(job);
+  if (job.engine === 'minimax') return runMinimaxJob(job);
+  return runHfJob(job);
+}
+
+function baseMeta(job, extra) {
+  return {
+    id: job.id,
+    title: job.input.title || '未命名作品',
+    style: job.input.style || '',
+    description: job.input.description || '',
+    lyrics: job.input.lyrics || '',
+    instrumental: Boolean(job.input.instrumental),
+    createdAt: Date.now(),
+    engine: job.engine,
+    ...extra,
+  };
+}
+
+async function completeJob(job, meta) {
+  await fsp.writeFile(path.join(AUDIO_DIR, `${job.id}.json`), JSON.stringify(meta, null, 2));
+  job.status = 'done';
+  job.progress = 1;
+  job.meta = meta;
+  job.audioUrl = meta.audio;
+  broadcast(job, { type: 'done', meta, audioUrl: meta.audio });
+  setStage(job, 'done', '完成', { progress: 1 });
+  for (const c of job.clients) { try { c.end(); } catch {} }
+  job.clients.clear();
+  job.chunks = [];
+  job.chunkBytes = 0;
+  log(`[${job.id.slice(0, 6)}] 完成：${meta.title} (${meta.duration}s)`);
+}
+
+function failJob(job, err) {
+  if (job.canceled) return;
+  job.status = 'error';
+  job.error = err.message;
+  log(`[${job.id.slice(0, 6)}] 失败：${err.message}`);
+  broadcast(job, { type: 'error', message: friendlyError(err.message) });
+  for (const c of job.clients) { try { c.end(); } catch {} }
+  job.clients.clear();
+}
+
+/* ---------- 引擎 A：Hugging Face 公益 Space（匿名免费） ---------- */
+async function runHfJob(job) {
+  try {
+    const input = job.input;
+    const state = {
+      mode: 'studio',
+      description: input.instrumental
+        ? `${input.description || input.style || 'instrumental music'}\nInstrumental, no vocals.`
+        : (input.description || input.style || ''),
+      instrumental: Boolean(input.instrumental),
+      title: input.title || '',
+      lyrics: input.lyrics || '[instrumental]',
+      global_meta: input.style || 'pop, warm production, 100 BPM',
+      vocals: '',
+      arrangement: '',
+    };
+
+    setStage(job, 'submitting', '正在连接免费音源…');
+    const auth = job.hfToken ? { 'x-hf-authorization': `Bearer ${job.hfToken}` } : {};
+    const start = await fetchJson(`${SPACE}/gradio_api/call/studio_generate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...auth },
+      body: JSON.stringify({
+        data: [state, input.duration, input.seed, true, 0, input.steps, 1.7],
+      }),
+      timeout: 60000,
+    });
+
+    if (!start.event_id) throw new Error('音源没有返回任务号（可能正在维护）');
+    job.eventId = start.event_id;
+    setStage(job, 'waiting', '已进入免费 GPU 队列，等待分配…');
+
+    const res = await requestFollow(
+      `${SPACE}/gradio_api/call/studio_generate/${start.event_id}`,
+      { headers: { accept: 'text/event-stream', ...auth }, timeout: 0 }
+    );
+    if (res.statusCode !== 200) {
+      const body = await readBody(res);
+      throw new Error(`音源事件流 ${res.statusCode}: ${body.slice(0, 200)}`);
+    }
+    job.upstreamRes = res;
+
+    const upstreamError = await consumeEvents(job, res);
+    if (job.canceled) return;
+    if (upstreamError) throw new Error(upstreamError);
+    if (!job.wavUrl) throw new Error('生成结束但没有收到音频文件');
+
+    setStage(job, 'downloading', '音频合成完成，正在保存…', { progress: 0.98 });
+    const wavPath = path.join(AUDIO_DIR, `${job.id}.wav`);
+    await downloadToFile(job.wavUrl, wavPath);
+    const stat = await fsp.stat(wavPath);
+
+    const meta = baseMeta(job, {
+      duration: Math.round(stat.size / (44100 * 4)),
+      requestedDuration: job.duration,
+      audio: `/api/audio/${job.id}.wav`,
+      format: 'wav',
+      bytes: stat.size,
+    });
+    await completeJob(job, meta);
+  } catch (err) {
+    failJob(job, err);
+  }
+}
+
+/* ---------- 引擎 B：MiniMax 官方音乐接口 ---------- */
+async function minimaxPost(pathname, body, key, timeout = 600000) {
+  const raw = await fetchJson(`${MINIMAX_BASE}${pathname}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    timeout,
+  }, 32 * 1024 * 1024);
+  const code = raw?.base_resp?.status_code;
+  if (code && code !== 0) {
+    const error = new Error(`MiniMax ${code}: ${raw?.base_resp?.status_msg || '接口返回错误'}`);
+    error.minimaxCode = code;
+    throw error;
+  }
+  return raw;
+}
+
+async function minimaxLyrics({ description, style, title, key }) {
+  const prompt = [description, style ? `风格：${style}` : '']
+    .filter(Boolean).join('\n').slice(0, 2000) || '一首好听的流行歌';
+  const body = { mode: 'write_full_song', prompt };
+  if (title) body.title = title;
+  const raw = await minimaxPost('/v1/lyrics_generation', body, key, 120000);
+  const src = raw.data && raw.data.lyrics ? raw.data : raw;
+  const lyrics = String(src.lyrics || '').trim();
+  if (lyrics.length < 20) throw new Error('官方写词接口没有返回有效歌词');
+  return {
+    title: String(src.song_title || title || '').trim().slice(0, 40) || description.slice(0, 16) || '未命名作品',
+    lyrics: lyrics.slice(0, 3500),
+    style: String(src.style_tags || style || '').trim().slice(0, 300),
+  };
+}
+
+async function runMinimaxJob(job) {
+  try {
+    const input = job.input;
+    const model = job.minimaxModel || MINIMAX_MODEL;
+    setStage(job, 'submitting', '正在提交到 MiniMax 官方接口…');
+
+    const prompt = [input.style, input.description]
+      .filter(Boolean).join('，').replace(/\s+/g, ' ').slice(0, 2000) || 'pop music, warm vocal';
+
+    const body = {
+      model,
+      prompt,
+      output_format: 'url',
+      is_instrumental: Boolean(input.instrumental),
+      audio_setting: { sample_rate: 44100, bitrate: 256000, format: 'mp3' },
+    };
+    if (input.lyrics && !/^\[instrumental\]$/i.test(input.lyrics)) {
+      body.lyrics = input.lyrics.slice(0, 3500);
+    } else if (!input.instrumental) {
+      body.lyrics_optimizer = true;
+    }
+
+    setStage(job, 'generating', `MiniMax ${model} 正在谱曲演唱…`, { progress: 0.08 });
+    job.status = 'generating';
+
+    const raw = await minimaxPost('/v1/music_generation', body, job.minimaxKey);
+    if (job.canceled) return;
+
+    const audioVal = raw?.data?.audio || raw?.data?.audio_url;
+    if (!audioVal) throw new Error('MiniMax 没有返回音频数据');
+    const info = raw.extra_info || {};
+
+    setStage(job, 'downloading', '生成完成，正在保存音频…', { progress: 0.96 });
+    const target = path.join(AUDIO_DIR, `${job.id}.mp3`);
+    if (/^https?:\/\//i.test(audioVal)) {
+      await downloadToFile(audioVal, target);
+    } else {
+      const hex = String(audioVal).replace(/[^0-9a-f]/gi, '');
+      if (hex.length < 64) throw new Error('MiniMax 返回的音频数据为空');
+      await fsp.writeFile(target, Buffer.from(hex, 'hex'));
+    }
+    const stat = await fsp.stat(target);
+    if (!stat.size) throw new Error('保存的音频为空');
+
+    const duration = info.music_duration
+      ? Math.max(1, Math.round(info.music_duration / 1000))
+      : Math.max(1, Math.round((stat.size * 8) / (info.bitrate || 256000)));
+
+    const meta = baseMeta(job, {
+      duration,
+      requestedDuration: input.duration,
+      audio: `/api/audio/${job.id}.mp3`,
+      format: 'mp3',
+      bytes: stat.size,
+      model,
+      sampleRate: info.music_sample_rate || 44100,
+      channels: info.music_channel || 2,
+    });
+    await completeJob(job, meta);
+  } catch (err) {
+    failJob(job, err);
+  }
+}
+
+function friendlyError(msg) {
+  if (/MiniMax web 1004|login fail|unauthorized/i.test(msg)) return '网页登录态已失效，请重新登录 www.minimax.cn 后复制新的 token。';
+  if (/网页接口超时/.test(msg)) return '网页接口 15 分钟没有返回结果，可能排队或任务异常，请重试。';
+  if (/网页接口断开/.test(msg)) return '网页接口连接被断开，请重试；如果反复失败，重新登录复制新 token。';
+  if (/审核/.test(msg)) return '输入内容触发了平台审核，换个描述或歌词再试。';
+  if (/网页接口没有返回可下载的音频/.test(msg)) return '网页接口没有返回音频，可能生成失败，请重试。';
+  if (/MiniMax 1004/.test(msg)) return 'MiniMax API Key 无效或已过期，请在「接口设置」里重新填写。';
+  if (/MiniMax 1008/.test(msg)) return 'MiniMax 账户余额不足。若使用 music-3.0-free 限免模型仍报此错，请检查模型名。';
+  if (/MiniMax (1002|1039|1013)/.test(msg)) return '官方接口触发限流（限免模型 RPM 3），请等 20~60 秒再试。';
+  if (/MiniMax 2013/.test(msg)) return '请求参数不合法：' + msg.replace(/^MiniMax\s*\d+:\s*/, '');
+  if (/MiniMax/.test(msg)) return '官方接口报错：' + msg.replace(/^MiniMax\s*/, '');
+  if (/ZeroGPU|quota|exceeded your|runs limit/i.test(msg)) {
+    return '匿名免费额度已用完（每天约 2 分钟 GPU，24 小时后重置）。可在「提升额度」里填入免费的 Hugging Face Token，额度会提升到每天 5 分钟。';
+  }
+  if (/exceeded|quota/i.test(msg)) return '免费 GPU 额度暂时用完了，请稍后再试。';
+  if (/GPU|ZeroGPU|queue/i.test(msg)) return '免费 GPU 正在排队或繁忙，请稍后重试。';
+  if (/410|404|maintenance|维护/i.test(msg)) return '免费音源暂时不可用，请稍后重试。';
+  if (/ECONN|ETIMEDOUT|请求超时|socket|network/i.test(msg)) return '网络连接失败，请检查代理后重试。';
+  return msg;
+}
+
+function consumeEvents(job, res) {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    let upstreamError = null;
+
+    res.setEncoding('utf8');
+    res.on('data', chunk => {
+      buf += chunk;
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const err = handleBlock(job, block);
+        if (err) upstreamError = err;
+      }
+    });
+    res.on('end', () => resolve(upstreamError));
+    res.on('error', reject);
+  });
+}
+
+function handleBlock(job, block) {
+  if (job.canceled) return null;
+  let event = 'message';
+  const dataLines = [];
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+  }
+  if (!dataLines.length) return null;
+
+  let data;
+  try { data = JSON.parse(dataLines.join('\n')); } catch { return null; }
+
+  if (event === 'error') {
+    if (typeof data === 'string') return data;
+    const detail = data?.error || data?.message || data?.title;
+    if (detail) return String(detail);
+    try { return JSON.stringify(data); } catch { return '音源返回错误'; }
+  }
+  if (!Array.isArray(data)) return null;
+
+  const [player, stats, file] = data;
+
+  if (player && typeof player === 'object') {
+    if (player.cmd === 'status') {
+      setStage(job, 'generating', translateStatus(player.text));
+    } else if (player.cmd === 'chunk' && player.pcm) {
+      handleChunk(job, player);
+    } else if (player.cmd === 'done') {
+      if (player.url && !job.wavUrl) job.wavUrl = new URL(player.url, SPACE).toString();
+      setProgress(job, 1);
+    }
+  }
+
+  if (file && file.url) job.wavUrl = file.url;
+
+  if (typeof stats === 'string') {
+    const m = stats.match(/([\d.]+)s of audio/);
+    if (m) {
+      const sec = parseFloat(m[1]);
+      job.seconds = sec;
+      if (job.status !== 'generating') setStage(job, 'generating', '正在演唱…');
+      setProgress(job, sec / Math.max(1, job.duration), sec);
+    }
+  }
+  return null;
+}
+
+function translateStatus(text) {
+  if (!text) return '正在生成…';
+  if (/Acquiring ZeroGPU|warming/i.test(text)) return '已分配到 GPU，正在调音…';
+  if (/composing|writing lyrics/i.test(text)) return '正在写词…';
+  if (/streaming/i.test(text)) return '正在演唱…';
+  if (/rendering/i.test(text)) return '正在收尾…';
+  if (/done/i.test(text)) return '完成';
+  return text;
+}
+
+function handleChunk(job, player) {
+  const seq = Number(player.seq) || 0;
+  if (seq && seq <= job.lastSeq) return;
+  if (job.status !== 'generating') setStage(job, 'generating', '正在演唱…');
+
+  if (job.chunkBytes < MAX_LIVE_CHUNK_BYTES) {
+    job.chunks.push({ seq, pcm: player.pcm, sr: player.sr || 44100, ch: player.ch || 2, off: player.off || 0 });
+    job.chunkBytes += player.pcm.length;
+  }
+  broadcast(job, {
+    type: 'chunk',
+    seq,
+    pcm: player.pcm,
+    sr: player.sr || 44100,
+    ch: player.ch || 2,
+  });
+
+  const sr = player.sr || 44100;
+  const seconds = ((player.off || 0) + ((player.pcm.length * 3) / 4 / 2)) / sr;
+  if (seconds) setProgress(job, seconds / Math.max(1, job.duration), seconds);
+}
+
+async function downloadToFile(url, dest) {
+  const res = await requestFollow(url, { timeout: 300000 });
+  if (res.statusCode !== 200) throw new Error(`下载音频失败 (${res.statusCode})`);
+  const tmp = dest + '.part';
+  await new Promise((resolve, reject) => {
+    const ws = fs.createWriteStream(tmp);
+    ws.on('finish', resolve);
+    ws.on('error', reject);
+    res.on('error', reject);
+    res.pipe(ws);
+  });
+  await fsp.rename(tmp, dest);
+}
+
+/* ------------------------------------------------------------------ *
+ * HTTP 服务
+ * ------------------------------------------------------------------ */
+function basicAuthOk(req) {
+  if (!ACCESS_PASSWORD) return true;
+  const header = req.headers.authorization || '';
+  const matched = /^Basic\s+(.+)$/i.exec(header);
+  if (!matched) return false;
+  let decoded = '';
+  try { decoded = Buffer.from(matched[1], 'base64').toString('utf8'); } catch { return false; }
+  const index = decoded.indexOf(':');
+  const password = index >= 0 ? decoded.slice(index + 1) : decoded;
+  const a = Buffer.from(password);
+  const b = Buffer.from(ACCESS_PASSWORD);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg',
+};
+
+function json(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+async function readJsonBody(req, limit = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const parts = [];
+    req.on('data', d => {
+      size += d.length;
+      if (size > limit) { reject(new Error('请求体过大')); req.destroy(); return; }
+      parts.push(d);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(parts).toString('utf8') || '{}')); }
+      catch { reject(new Error('请求体不是合法 JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function clampInt(v, min, max, fallback) {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function cleanText(v, max) {
+  return String(v ?? '').replace(/\u0000/g, '').trim().slice(0, max);
+}
+
+function pickMinimaxModel(raw) {
+  const model = String(raw || '').trim();
+  return MINIMAX_MODELS.includes(model) ? model : MINIMAX_MODEL;
+}
+
+// MiniMax 的 Key 是 JWT 形式；格式明显不对就不转发
+function pickMinimaxKey(raw) {
+  const key = String(raw || '').trim();
+  if (key.length >= 20 && /^[A-Za-z0-9._-]+$/.test(key)) return key;
+  return MINIMAX_KEY;
+}
+
+async function serveStatic(req, res, pathname) {
+  let rel = decodeURIComponent(pathname);
+  if (rel === '/' || rel === '') rel = '/index.html';
+  const filePath = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (!filePath.startsWith(PUBLIC_DIR)) { res.writeHead(403).end('Forbidden'); return; }
+  try {
+    const stat = await fsp.stat(filePath);
+    if (!stat.isFile()) throw new Error('not a file');
+    res.writeHead(200, {
+      'content-type': MIME[path.extname(filePath)] || 'application/octet-stream',
+      'content-length': stat.size,
+      'cache-control': 'no-cache',
+    });
+    fs.createReadStream(filePath).pipe(res);
+  } catch {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('404 Not Found');
+  }
+}
+
+async function serveAudio(req, res, id, ext = 'wav') {
+  const filePath = path.join(AUDIO_DIR, `${id}.${ext}`);
+  let stat;
+  try { stat = await fsp.stat(filePath); } catch { res.writeHead(404).end('not found'); return; }
+
+  const headers = {
+    'content-type': ext === 'mp3' ? 'audio/mpeg' : 'audio/wav',
+    'accept-ranges': 'bytes',
+    'cache-control': 'public, max-age=86400',
+  };
+  const range = req.headers.range;
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range);
+    let start = m && m[1] ? Number(m[1]) : 0;
+    let end = m && m[2] ? Number(m[2]) : stat.size - 1;
+    if (start >= stat.size) {
+      res.writeHead(416, { 'content-range': `bytes */${stat.size}` }).end();
+      return;
+    }
+    end = Math.min(end, stat.size - 1);
+    res.writeHead(206, {
+      ...headers,
+      'content-range': `bytes ${start}-${end}/${stat.size}`,
+      'content-length': end - start + 1,
+    });
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, { ...headers, 'content-length': stat.size });
+    fs.createReadStream(filePath).pipe(res);
+  }
+}
+
+async function listLibrary() {
+  const files = await fsp.readdir(AUDIO_DIR);
+  const items = [];
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue;
+    try {
+      const meta = JSON.parse(await fsp.readFile(path.join(AUDIO_DIR, f), 'utf8'));
+      const audioName = meta.audio ? path.basename(meta.audio) : f.replace(/\.json$/, '.wav');
+      await fsp.access(path.join(AUDIO_DIR, audioName));
+      items.push(meta);
+    } catch { /* 忽略损坏记录 */ }
+  }
+  items.sort((a, b) => b.createdAt - a.createdAt);
+  return items.slice(0, 60);
+}
+
+async function proxyHealth() {
+  const started = Date.now();
+  try {
+    const res = await requestFollow('https://huggingface.co/api/spaces/MiniMaxAI/MiniMax-Music3', { timeout: 12000 });
+    await readBody(res, 256 * 1024);
+    // 429/401 也说明能连上，只是被限流
+    return { ok: res.statusCode < 500, latency: Date.now() - started, code: res.statusCode };
+  } catch (e) {
+    return { ok: false, latency: Date.now() - started, error: e.message };
+  }
+}
+
+let healthCache = { at: 0, value: null };
+
+async function handleApi(req, res, url) {
+  const { pathname } = url;
+
+  if (pathname === '/api/health' && req.method === 'GET') {
+    if (url.searchParams.has('fresh') || Date.now() - healthCache.at > 30000) {
+      healthCache = { at: Date.now(), value: await proxyHealth() };
+    }
+    return json(res, 200, {
+      ...healthCache.value,
+      proxy: PROXY ? `${PROXY.host}:${PROXY.port}` : null,
+      proxyMode: PROXY ? (proxyReady() ? 'proxy' : 'direct-fallback') : 'direct',
+      running,
+      pending: queue.length,
+    });
+  }
+
+  if (pathname === '/api/config' && req.method === 'GET') {
+    return json(res, 200, {
+      engine: 'MiniMax Music 3',
+      maxDuration: MAX_DURATION,
+      minDuration: MIN_DURATION,
+      hasServerToken: Boolean(DEFAULT_HF_TOKEN),
+      hasMinimaxKey: Boolean(MINIMAX_KEY),
+      hasWebToken: Boolean(MM_WEB_TOKEN),
+      webModels: MM_WEB_MODELS,
+      minimaxModel: MINIMAX_MODEL,
+      minimaxModels: MINIMAX_MODELS,
+      minimaxBase: MINIMAX_BASE,
+      anonymousQuotaHint: '匿名额度每天约 2 分钟 GPU；免费 HF Token 为每天 5 分钟',
+    });
+  }
+
+  if (pathname === '/api/lyrics' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const duration = clampInt(body.duration, MIN_DURATION, MAX_DURATION, 60);
+    const description = cleanText(body.description, 600);
+    const style = cleanText(body.style, 240);
+    const instrumental = Boolean(body.instrumental);
+    const minimaxKey = pickMinimaxKey(body.minimaxKey);
+
+    if (instrumental) {
+      return json(res, 200, {
+        title: cleanText(body.title, 40) || description.slice(0, 16) || '纯音乐',
+        lyrics: '[instrumental]',
+        style,
+        engine: minimaxKey ? 'minimax' : 'hf',
+      });
+    }
+
+    // 有官方 Key 时优先用官方写词接口（歌名/风格标签/歌词一次给全）
+    if (minimaxKey) {
+      try {
+        const result = await minimaxLyrics({
+          description,
+          style,
+          title: cleanText(body.title, 60),
+          key: minimaxKey,
+        });
+        return json(res, 200, { ...result, engine: 'minimax' });
+      } catch (e) {
+        log('官方写词失败：', e.message);
+        if (/MiniMax 1004/.test(e.message)) {
+          return json(res, 502, { error: friendlyError(e.message) });
+        }
+        // 余额不足 / 限流 / 其他异常：回退到公益写词，不阻塞后续音乐生成
+      }
+    }
+
+    try {
+      const result = await writeLyrics({ description, style, instrumental, duration });
+      return json(res, 200, { ...result, engine: 'hf' });
+    } catch (e) {
+      log('写词失败：', e.message);
+      return json(res, 502, { error: '歌词生成失败：' + friendlyError(e.message) });
+    }
+  }
+
+  if (pathname === '/api/generate' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const description = cleanText(body.description, 1000);
+    const lyrics = cleanText(body.lyrics, 8000);
+    const instrumental = Boolean(body.instrumental);
+    if (!description && !lyrics && !body.style) {
+      return json(res, 400, { error: '至少写点描述或歌词吧' });
+    }
+    const minimaxKey = pickMinimaxKey(body.minimaxKey);
+    const minimaxModel = pickMinimaxModel(body.minimaxModel);
+    const mmWebToken = pickWebToken(body.mmWebToken);
+    if (!instrumental && lyrics.length < 10 && !minimaxKey && !mmWebToken) {
+      return json(res, 400, { error: '歌词太短了，至少写几句' });
+    }
+    const input = {
+      title: cleanText(body.title, 60) || '未命名作品',
+      description,
+      lyrics: instrumental ? '[instrumental]' : lyrics,
+      style: cleanText(body.style, 300) || 'pop, warm production, 100 BPM',
+      duration: clampInt(body.duration, MIN_DURATION, MAX_DURATION, 60),
+      steps: clampInt(body.steps, 4, 60, 30),
+      instrumental,
+      seed: crypto.randomInt(1, 2147483647),
+    };
+    const rawToken = cleanText(body.hfToken, 200);
+    const hfToken = /^(hf_|api_)[A-Za-z0-9_-]{10,}$/.test(rawToken) ? rawToken : DEFAULT_HF_TOKEN;
+    const job = createJob(input, hfToken, minimaxKey, minimaxModel, mmWebToken);
+    enqueue(job);
+    log(`[${job.id.slice(0, 6)}] 新任务（${job.engine}${job.engine === 'minimax' ? ' / ' + job.minimaxModel : ''}）：${input.title} / ${input.duration}s / ${input.style}`);
+    return json(res, 200, { id: job.id, status: job.status, engine: job.engine });
+  }
+
+  const jobMatch = pathname.match(/^\/api\/jobs\/([a-f0-9]{16})(\/stream|\/cancel)?$/);
+  if (jobMatch) {
+    const job = jobs.get(jobMatch[1]);
+    if (!job) return json(res, 404, { error: '任务不存在或已过期' });
+    const action = jobMatch[2];
+
+    if (action === '/cancel' && req.method === 'POST') {
+      job.canceled = true;
+      job.status = 'canceled';
+      try { job.upstreamRes?.destroy(); } catch {}
+      try {
+        if (job.webSocket) {
+          try { job.webSocket.send(JSON.stringify({ method: 'StopMusicGen', payload: {}, msg_id: crypto.randomUUID() })); } catch {}
+          job.webSocket.close();
+        }
+      } catch {}
+      broadcast(job, { type: 'error', message: '已停止生成' });
+      for (const c of job.clients) { try { c.end(); } catch {} }
+      job.clients.clear();
+      return json(res, 200, { ok: true });
+    }
+
+    if (action === '/stream' && req.method === 'GET') {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        'connection': 'keep-alive',
+        'x-accel-buffering': 'no',
+      });
+      res.write(': hello\n\n');
+      job.clients.add(res);
+
+      sseSend(res, {
+        type: 'status', stage: job.stage, message: job.message,
+        progress: job.progress, status: job.status, engine: job.engine,
+      });
+      for (const c of job.chunks) {
+        sseSend(res, { type: 'chunk', seq: c.seq, pcm: c.pcm, sr: c.sr, ch: c.ch });
+      }
+      if (job.status === 'done' && job.meta) {
+        sseSend(res, { type: 'done', meta: job.meta, audioUrl: job.audioUrl });
+        res.end();
+        return;
+      }
+      if (job.status === 'error') {
+        sseSend(res, { type: 'error', message: friendlyError(job.error || '生成失败') });
+        res.end();
+        return;
+      }
+      const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 15000);
+      req.on('close', () => { clearInterval(ping); job.clients.delete(res); });
+      return;
+    }
+
+    return json(res, 200, {
+      id: job.id,
+      engine: job.engine,
+      status: job.status,
+      stage: job.stage,
+      message: job.message,
+      progress: job.progress,
+      seconds: job.seconds,
+      duration: job.duration,
+      audioUrl: job.audioUrl,
+      meta: job.meta || null,
+      error: job.status === 'error' ? friendlyError(job.error || '') : null,
+    });
+  }
+
+  if (pathname === '/api/library' && req.method === 'GET') {
+    return json(res, 200, { items: await listLibrary() });
+  }
+
+  return json(res, 404, { error: 'Not found' });
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  try {
+    // Render 健康检查：不鉴权、不访问上游
+    if (url.pathname === '/healthz') {
+      return json(res, 200, { ok: true, uptime: Math.round(process.uptime()) });
+    }
+
+    if (!basicAuthOk(req)) {
+      res.writeHead(401, {
+        'www-authenticate': 'Basic realm="SonicWave", charset="UTF-8"',
+        'content-type': 'text/plain; charset=utf-8',
+      });
+      res.end('需要访问密码');
+      return;
+    }
+
+    const audio = url.pathname.match(/^\/api\/audio\/([a-f0-9]{16})\.(wav|mp3)$/);
+    if (audio) return serveAudio(req, res, audio[1], audio[2]);
+    if (url.pathname.startsWith('/api/')) {
+      await handleApi(req, res, url);
+      return;
+    }
+    await serveStatic(req, res, url.pathname);
+  } catch (e) {
+    log('请求出错：', e.message);
+    if (!res.headersSent) json(res, 500, { error: e.message });
+    else res.end();
+  }
+});
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (job.status === 'done' || job.status === 'error' || job.status === 'canceled') {
+      job.chunks = [];
+      job.chunkBytes = 0;
+    }
+    if (now - job.createdAt > JOB_TTL_MS && job.clients.size === 0) jobs.delete(id);
+  }
+}, 5 * 60 * 1000).unref();
+
+process.on('unhandledRejection', err => log('未处理的 Promise 拒绝：', err?.message || err));
+process.on('uncaughtException', err => log('未捕获异常：', err?.stack || err));
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    log(`端口 ${PORT} 已被占用，换一个端口再启动：SONICWAVE_PORT=8900 node server.mjs`);
+    process.exit(1);
+  }
+  throw err;
+});
+
+// 没有显式代理时，后台先探一次本机常见端口，避免首个请求先吃一次直连失败
+if (!PROXY && !PROXY_OFF && !IS_RENDER) {
+  probeLocalProxies().then(p => { if (p) useProxy(p, '自动探测到本机代理'); });
+}
+
+server.listen(PORT, HOST, () => {
+  log(`服务已启动 →  http://${HOST}:${PORT}`);
+  log(`网络模式：${PROXY ? `代理 ${PROXY.host}:${PROXY.port}（失败会自动切换/探测）` : IS_RENDER ? '直连（Render 云上）' : '未检测到代理，正在探测本机常见端口…'}`);
+  log(`监听：${HOST}:${PORT}${ACCESS_PASSWORD ? ' · 已开启访问密码' : ''}${IS_RENDER ? ' · Render' : ''}`);
+  log('音乐模型：MiniMax Music 3 · Hugging Face Space（匿名免费）');
+});
