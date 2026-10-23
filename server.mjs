@@ -41,6 +41,9 @@ const MM_WEB_TOKEN = (process.env.MM_WEB_TOKEN || '').trim();
 const MM_WEB_OP_TICKET = (process.env.MM_WEB_OP_TICKET || '').trim();
 const MM_WEB_BASE = 'https://www.minimax.cn';
 const MM_WEB_MODELS = ['music-3.0', 'music-2.6'];
+const STEP_BASE = 'https://www.stepfun.com';
+const STEP_TOKEN = (process.env.STEP_TOKEN || '').trim();
+const STEP_MODEL = 'step-music';
 const MINIMAX_KEY = (process.env.MINIMAX_API_KEY || '').trim();
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 2;
 const MAX_DURATION = 180;
@@ -769,6 +772,180 @@ async function runWebJob(job) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 引擎 D：StepFun 阶跃音乐（网页登录态，非官方接口）
+ * Oasis-Token 的格式是 <access>...<refresh>，用 RefreshToken 换新 access。
+ * ------------------------------------------------------------------ */
+function stepCookie(access, refresh, webid) {
+  return `Oasis-Webid=${webid}; Oasis-appID=10200; Oasis-Platform=web; Oasis-Token=${access}...${refresh}`;
+}
+
+function parseStepToken(raw) {
+  let text = String(raw || '').trim();
+  if (!text) return null;
+  let webid = '';
+  if (text.includes('Oasis-Token=')) {
+    const wm = text.match(/Oasis-Webid=([^;]+)/);
+    if (wm) webid = wm[1].trim();
+    const tm = text.match(/Oasis-Token=([^;\s]+)/);
+    text = tm ? decodeURIComponent(tm[1]) : '';
+  }
+  const idx = text.indexOf('...');
+  let access = '';
+  let refresh = text;
+  if (idx >= 0) {
+    access = text.slice(0, idx);
+    refresh = text.slice(idx + 3);
+  }
+  if (!refresh || !/^eyJ/.test(refresh)) return null;
+  const payload = jwtPayload(refresh);
+  webid = webid || String(payload?.device_id || '');
+  if (!webid) return null;
+  return { access, refresh, webid, token: text };
+}
+
+async function stepPost(pathname, body, cookie, timeout = 60000) {
+  const res = await requestFollow(STEP_BASE + pathname, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'connect-protocol-version': '1',
+      'oasis-appid': '10200',
+      'oasis-platform': 'web',
+      origin: 'https://www.stepfun.com',
+      referer: 'https://www.stepfun.com/studio/audio?tab=music',
+      'x-waf-client-type': 'fetch_sdk',
+      accept: '*/*',
+      cookie,
+    },
+    body: JSON.stringify(body),
+    timeout,
+  });
+  const text = await readBody(res, 16 * 1024 * 1024);
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* 非 JSON */ }
+  if (res.statusCode !== 200 || data?.code) {
+    throw new Error(`StepFun ${res.statusCode}: ${data?.message || data?.code || text.slice(0, 120)}`);
+  }
+  if (!data) throw new Error('StepFun 返回了非 JSON');
+  return data;
+}
+
+async function stepRefresh(parsed) {
+  const cookie = stepCookie(parsed.access, parsed.refresh, parsed.webid);
+  const data = await stepPost(
+    '/passport/proto.api.passport.v1.PassportService/RefreshToken', {}, cookie, 30000
+  );
+  const access = data?.accessToken?.raw;
+  const refresh = data?.refreshToken?.raw || parsed.refresh;
+  if (!access) throw new Error('StepFun 登录态刷新失败');
+  const accessPayload = jwtPayload(access);
+  const refreshPayload = jwtPayload(parsed.refresh);
+  if (accessPayload?.activated === false || accessPayload?.mode === 1) {
+    throw new Error('StepFun 登录态已过期，请重新复制 Oasis-Token');
+  }
+  if (accessPayload?.oasis_id && refreshPayload?.oasis_id
+      && String(accessPayload.oasis_id) !== String(refreshPayload.oasis_id)) {
+    throw new Error('StepFun 登录态已过期，请重新复制 Oasis-Token');
+  }
+  return { cookie: stepCookie(access, refresh, parsed.webid), access, refresh };
+}
+
+function pickStepToken(raw) {
+  const token = String(raw || '').trim();
+  if (parseStepToken(token)) return token;
+  return STEP_TOKEN;
+}
+
+/* ---------- 引擎 D：StepFun 任务 ---------- */
+async function runStepfunJob(job) {
+  try {
+    const input = job.input;
+    const parsed = parseStepToken(job.stepToken);
+    if (!parsed) throw new Error('StepFun 登录态格式不对，请复制完整的 Oasis-Token');
+
+    setStage(job, 'submitting', '正在刷新 StepFun 登录态…');
+    const session = await stepRefresh(parsed);
+    const cookie = session.cookie;
+
+    try {
+      const quota = await stepPost('/api/audio/capy.audio.v1.AudioService/GetQuota', {}, cookie, 20000);
+      const remaining = Number(quota?.musicQuota?.remainingQuota);
+      if (Number.isFinite(remaining) && remaining <= 0) throw new Error('StepFun 音乐额度已用完');
+    } catch (e) {
+      if (/额度已用完/.test(e.message)) throw e;
+      // 配额接口异常不阻塞提交，交给提交接口报错
+    }
+
+    const caption = [input.style, input.description]
+      .filter(Boolean).join('，').replace(/\s+/g, ' ').slice(0, 2000) || 'pop music, warm vocal';
+    const body = {
+      task: 'MUSIC_TASK_TYPE_TEXT_TO_MUSIC',
+      modelId: STEP_MODEL,
+      title: (input.title || '未命名作品').slice(0, 100),
+      caption,
+      lyrics: input.instrumental ? '' : (input.lyrics || '').slice(0, 5000),
+      instrumental: Boolean(input.instrumental),
+      responseFormat: 'AUDIO_FORMAT_MP3',
+    };
+
+    setStage(job, 'submitting', '正在提交到 StepFun 阶跃音乐…');
+    const submit = await stepPost(
+      '/api/audio/capy.audio.v1.AudioService/SubmitMusicTask', body, cookie, 60000
+    );
+    const taskId = submit?.taskId;
+    if (!taskId) throw new Error('StepFun 没有返回任务号');
+
+    setStage(job, 'generating', '阶跃音乐正在谱曲演唱，通常 1~3 分钟…', { progress: 0.1 });
+    job.status = 'generating';
+
+    const started = Date.now();
+    let record = null;
+    while (Date.now() - started < 10 * 60 * 1000) {
+      if (job.canceled) return;
+      await sleep(3000);
+      const result = await stepPost(
+        '/api/audio/capy.audio.v1.AudioService/GetMusicTask',
+        { taskId, withAudioB64: false },
+        cookie,
+        30000
+      );
+      record = result?.musicRecord || null;
+      const status = record?.status;
+      if (status === 'MUSIC_TASK_STATUS_SUCCESS') break;
+      if (status === 'MUSIC_TASK_STATUS_FAILED') throw new Error('StepFun 生成失败，可能触发了审核或模型异常');
+      setStage(job, 'generating',
+        status === 'MUSIC_TASK_STATUS_PENDING' ? '阶跃音乐排队中…' : '阶跃音乐正在演唱…');
+    }
+    if (!record || record.status !== 'MUSIC_TASK_STATUS_SUCCESS') throw new Error('StepFun 生成超时');
+    if (!record.audioUrl) throw new Error('StepFun 没有返回音频地址');
+
+    setStage(job, 'downloading', '生成完成，正在保存音频…', { progress: 0.96 });
+    const target = path.join(AUDIO_DIR, `${job.id}.mp3`);
+    await downloadToFile(record.audioUrl, target);
+    const stat = await fsp.stat(target);
+    if (!stat.size) throw new Error('保存的音频为空');
+
+    const duration = record.duration
+      ? Math.max(1, Math.round(record.duration))
+      : Math.max(1, Math.round((stat.size * 8) / 256000));
+
+    const meta = baseMeta(job, {
+      title: record.title || input.title || '未命名作品',
+      lyrics: record.lyrics || input.lyrics || '',
+      duration,
+      requestedDuration: input.duration,
+      audio: `/api/audio/${job.id}.mp3`,
+      format: 'mp3',
+      bytes: stat.size,
+      model: STEP_MODEL,
+    });
+    await completeJob(job, meta);
+  } catch (err) {
+    failJob(job, err);
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * 任务：提交 Gradio → 消费 SSE → 下载 WAV
  * ------------------------------------------------------------------ */
 const jobs = new Map();
@@ -802,7 +979,7 @@ function setProgress(job, ratio, seconds) {
   broadcast(job, { type: 'progress', progress: p, seconds: job.seconds, duration: job.duration });
 }
 
-function createJob(input, hfToken = '', minimaxKey = '', minimaxModel = MINIMAX_MODEL, mmWebToken = '') {
+function createJob(input, hfToken = '', minimaxKey = '', minimaxModel = MINIMAX_MODEL, mmWebToken = '', stepToken = '') {
   const id = crypto.randomBytes(8).toString('hex');
   const job = {
     id,
@@ -822,7 +999,8 @@ function createJob(input, hfToken = '', minimaxKey = '', minimaxModel = MINIMAX_
     minimaxKey,
     minimaxModel,
     mmWebToken,
-    engine: mmWebToken ? 'web' : (minimaxKey ? 'minimax' : 'hf'),
+    stepToken,
+    engine: stepToken ? 'stepfun' : (mmWebToken ? 'web' : (minimaxKey ? 'minimax' : 'hf')),
     input,
     wavUrl: null,
     audioUrl: null,
@@ -847,6 +1025,7 @@ function enqueue(job) {
 }
 
 async function runJob(job) {
+  if (job.engine === 'stepfun') return runStepfunJob(job);
   if (job.engine === 'web') return runWebJob(job);
   if (job.engine === 'minimax') return runMinimaxJob(job);
   return runHfJob(job);
@@ -1054,6 +1233,12 @@ async function runMinimaxJob(job) {
 }
 
 function friendlyError(msg) {
+  if (/StepFun.*(unauthenticated|token is illegal|401)/i.test(msg)) return 'StepFun 登录态已失效，请重新登录 www.stepfun.com 后复制新的 Oasis-Token。';
+  if (/StepFun 登录态已过期/.test(msg)) return 'StepFun 登录态已过期（access token 约 30 分钟），请重新复制完整的 Oasis-Token。';
+  if (/StepFun 音乐额度已用完/.test(msg)) return 'StepFun 账号的音乐生成额度已用完。';
+  if (/StepFun 生成失败/.test(msg)) return 'StepFun 生成失败，可能触发审核或模型异常，请重试或换歌词。';
+  if (/StepFun 生成超时/.test(msg)) return 'StepFun 10 分钟没有返回结果，请重试。';
+  if (/StepFun/.test(msg)) return 'StepFun 接口报错：' + msg.replace(/^StepFun\s*/, '');
   if (/MiniMax web 1004|login fail|unauthorized/i.test(msg)) return '网页登录态已失效，请重新登录 www.minimax.cn 后复制新的 token。';
   if (/网页接口超时/.test(msg)) return '网页接口 15 分钟没有返回结果，可能排队或任务异常，请重试。';
   if (/网页接口断开/.test(msg)) return '网页接口连接被断开，请重试；如果反复失败，重新登录复制新 token。';
@@ -1373,6 +1558,8 @@ async function handleApi(req, res, url) {
       hasServerToken: Boolean(DEFAULT_HF_TOKEN),
       hasMinimaxKey: Boolean(MINIMAX_KEY),
       hasWebToken: Boolean(MM_WEB_TOKEN),
+      hasStepToken: Boolean(STEP_TOKEN),
+      stepModel: STEP_MODEL,
       webModels: MM_WEB_MODELS,
       minimaxModel: MINIMAX_MODEL,
       minimaxModels: MINIMAX_MODELS,
@@ -1437,7 +1624,8 @@ async function handleApi(req, res, url) {
     const minimaxKey = pickMinimaxKey(body.minimaxKey);
     const minimaxModel = pickMinimaxModel(body.minimaxModel);
     const mmWebToken = pickWebToken(body.mmWebToken);
-    if (!instrumental && lyrics.length < 10 && !minimaxKey && !mmWebToken) {
+    const stepToken = pickStepToken(body.stepToken);
+    if (!instrumental && lyrics.length < 10 && !minimaxKey && !mmWebToken && !stepToken) {
       return json(res, 400, { error: '歌词太短了，至少写几句' });
     }
     const input = {
@@ -1452,7 +1640,7 @@ async function handleApi(req, res, url) {
     };
     const rawToken = cleanText(body.hfToken, 200);
     const hfToken = /^(hf_|api_)[A-Za-z0-9_-]{10,}$/.test(rawToken) ? rawToken : DEFAULT_HF_TOKEN;
-    const job = createJob(input, hfToken, minimaxKey, minimaxModel, mmWebToken);
+    const job = createJob(input, hfToken, minimaxKey, minimaxModel, mmWebToken, stepToken);
     enqueue(job);
     log(`[${job.id.slice(0, 6)}] 新任务（${job.engine}${job.engine === 'minimax' ? ' / ' + job.minimaxModel : ''}）：${input.title} / ${input.duration}s / ${input.style}`);
     return json(res, 200, { id: job.id, status: job.status, engine: job.engine });

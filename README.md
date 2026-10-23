@@ -1,21 +1,40 @@
 # 声浪 SonicWave · AI 歌曲生成
 
-参考 suno.cn 交互的本地网页：**输入一句话 → AI 写词 → 谱曲演唱 → 试听 → 下载**。三种引擎可选，默认无需登录、无需 Key 也能用。
+参考 suno.cn 交互的本地网页：**输入一句话 → AI 写词 → 谱曲演唱 → 试听 → 下载**。四种引擎可选，默认无需登录、无需 Key 也能用。
 
 ![界面预览](preview.png)
 
-## 三种引擎
+## 四种引擎
 
-| | 网页登录态（实验性） | MiniMax 官方接口 | 公益免费 Space |
-| --- | --- | --- | --- |
-| 触发条件 | 填入 www.minimax.cn 的登录 Token | 填入 MiniMax API Key | 不填（默认） |
-| 写词 | 官方歌词接口 / Pollinations | 官方 `/v1/lyrics_generation`，失败回退 Pollinations | Pollinations |
-| 音乐 | 网页版 `music-3.0` / `music-2.6` | `music-3.0-free`（限免，RPM 3）等 | [MiniMax Music 3](https://huggingface.co/spaces/MiniMaxAI/MiniMax-Music3) 公开 Space |
-| 额度 | 消耗网页账号的创作次数 | 官方限免模型，按账号限速 | 匿名约 2 分钟 GPU/天 |
-| 输出 | MP3 · 44.1kHz | MP3 · 44.1kHz | WAV · 44.1kHz |
-| 实时试听 | 不支持 | 不支持 | 支持，边生成边播放 |
+| | StepFun 阶跃（实验性） | 网页登录态（实验性） | MiniMax 官方接口 | 公益免费 Space |
+| --- | --- | --- | --- | --- |
+| 触发条件 | 填入 www.stepfun.com 的 Oasis-Token | 填入 www.minimax.cn 的登录 Token | 填入 MiniMax API Key | 不填（默认） |
+| 写词 | 本地歌词 / Pollinations | 官方歌词接口 / Pollinations | 官方 `/v1/lyrics_generation`，失败回退 Pollinations | Pollinations |
+| 音乐 | `step-music` | 网页版 `music-3.0` / `music-2.6` | `music-3.0-free`（限免，RPM 3）等 | [MiniMax Music 3](https://huggingface.co/spaces/MiniMaxAI/MiniMax-Music3) 公开 Space |
+| 额度 | 账号音乐额度（示例账号 10 次） | 网页账号创作次数 | 官方限免模型，按账号限速 | 匿名约 2 分钟 GPU/天 |
+| 输出 | MP3 · 44.1kHz | MP3 · 44.1kHz | MP3 · 44.1kHz | WAV · 44.1kHz |
+| 实时试听 | 不支持 | 不支持 | 不支持 | 支持，边生成边播放 |
 
-优先级：**网页登录态 > 官方 API Key > 公益 Space**。填了多个时按这个顺序走，页面顶部会显示当前实际使用的引擎。
+优先级：**StepFun > 网页登录态 > 官方 API Key > 公益 Space**。填了多个时按这个顺序走，页面顶部会显示当前实际使用的引擎。
+
+### StepFun 阶跃音乐（实验性）
+
+网页版内部接口，HTTP 提交 + 轮询：
+
+- 提交：`POST https://www.stepfun.com/api/audio/capy.audio.v1.AudioService/SubmitMusicTask`
+- 轮询：`.../GetMusicTask`，`MUSIC_TASK_STATUS_SUCCESS` 后返回 `audioUrl` 和 `duration`
+- 额度：`.../GetQuota`（示例账号音乐额度共 10 次）
+- 鉴权：`Oasis-Token` Cookie，格式是 `<access>...<refresh>`；服务端通过 `/passport/proto.api.passport.v1.PassportService/RefreshToken` 自动续期
+- 固定模型 `step-music`，支持 `instrumental`；歌曲长度由歌词决定
+
+**怎么拿 Token**：登录 <https://www.stepfun.com/studio/audio?tab=music> → DevTools → Application → Cookies → 复制 `Oasis-Token` 的完整值（中间有一个 `...` 分隔两段 JWT），整段粘到网页「接口设置 → StepFun 登录态」。
+
+**注意**：
+
+- access token 约 **30 分钟**过期，refresh token 约 30 天；服务端会先刷新，如果 access 过期太久则需要在网页重新复制。
+- 会消耗账号的音乐生成额度，生成记录也会出现在阶跃的「我的作品」里。
+- 非官方接口，可能随时失效；自动化使用可能不符合网站条款。
+- 从 Render 海外机房访问 `stepfun.com` 可能较慢或被 WAF 拦截。
 
 ### 网页登录态（实验性）
 
@@ -77,6 +96,7 @@ Windows 也可以直接双击 `start.bat`，会自动启动并打开浏览器。
 
 ## 功能
 
+- **四种引擎**：StepFun 阶跃 / MiniMax 网页登录态 / MiniMax 官方 API / 公益免费 Space，按优先级自动选择
 - **简单模式**：一句描述 → AI 写词 → 生成完整歌曲
 - **自定义模式**：自己写歌词（`[Verse]` / `[Chorus]` 分段）+ 风格标签
 - **纯音乐**：跳过人声
@@ -93,7 +113,8 @@ Windows 也可以直接双击 `start.bat`，会自动启动并打开浏览器。
 | `SONICWAVE_PORT` | 端口 | `8899` |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 出站代理 | 自动读取 Windows 系统代理 |
 | `PROXY=off` | 强制直连 | — |
-| `MM_WEB_TOKEN` | 服务器级网页登录态 Token（等价于网页里填） | 空 |
+| `STEP_TOKEN` | 服务器级 StepFun Oasis-Token（等价于网页里填） | 空 |
+| `MM_WEB_TOKEN` | 服务器级 MiniMax 网页登录态 Token（等价于网页里填） | 空 |
 | `MM_WEB_OP_TICKET` | 网页端的 op_ticket（一般不用填） | 空 |
 | `MINIMAX_API_KEY` | 服务器级 MiniMax Key（等价于网页里填） | 空 |
 | `MINIMAX_MODEL` | 官方默认模型（网页里可覆盖） | `music-3.0-free` |
@@ -123,12 +144,13 @@ ai-song/
 - **公益引擎**：通过 Gradio 的 `studio_generate` 接口，服务端把上游事件流转成 SSE，PCM 块实时推给浏览器用 Web Audio 播放。
 - **官方引擎**：一次性 HTTP 返回（`output_format: url`），后端拿到 24 小时有效的音频 URL 后立刻下载缓存。
 - **网页引擎**：服务端直连 WebSocket，心跳保活，等到 `status=2` 后用历史列表补全 `audio_url` / 时长 / 封面，再下载缓存。
+- **StepFun 引擎**：先刷新 token，再 `SubmitMusicTask` 提交、每 3 秒 `GetMusicTask` 轮询，成功后下载 `audioUrl`。
 - 官方和网页引擎没有流式进度，前端用缓动进度条示意；公益引擎是真实进度。
 - 上游网络请求优先走 `curl`：国内网络里 Node(OpenSSL) 的 TLS 握手更容易被重置，而 Windows 自带的 curl（Schannel）稳定得多。WebSocket 用 Node 内置实现，直连 `www.minimax.cn`。
 
 ## 说明与限制
 
-- 网页登录态是**非官方、实验性**能力：可能随时失效，可能不符合网站条款，账号也可能因此受限，请自行判断。
+- StepFun 和 MiniMax 网页登录态都是**非官方、实验性**能力：可能随时失效，可能不符合网站条款，账号也可能因此受限，请自行判断。
 - 官方限免模型不扣费但限速（RPM 3）；正式模型按 MiniMax 计费。
 - 公益 Space 的匿名额度很小，适合尝鲜；高峰期会排队。
 - 请勿做成公开高并发服务，每一次生成都在真实消耗模型方/账号的算力或次数。

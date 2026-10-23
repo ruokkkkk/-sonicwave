@@ -66,7 +66,7 @@ Render Dashboard → **New → Web Service** → 选仓库，然后：
 ## 安全（重要）
 
 - **一定要设置 `ACCESS_PASSWORD`**。不设的话，任何拿到 URL 的人都能用你的实例，而且「我的作品」是所有人共享的。
-- 不要在**公开实例**的环境变量里配置 `MM_WEB_TOKEN` 或 `MINIMAX_API_KEY`：那等于把你的账号额度开放给所有访问者。让每个用户在自己的浏览器里填自己的 Key/Token 即可。私用实例加了密码后，再考虑配在环境变量里。
+- 不要在**公开实例**的环境变量里配置 `STEP_TOKEN`、`MM_WEB_TOKEN` 或 `MINIMAX_API_KEY`：那等于把你的账号额度开放给所有访问者。让每个用户在自己的浏览器里填自己的 Key/Token 即可。私用实例加了密码后，再考虑配在环境变量里。
 - 访客在页面里填的 Key/Token 只保存在**访客自己的浏览器 localStorage**，经你的服务转发给 MiniMax，不会落盘、不会写日志。
 - 不要把这套服务暴露成无密码的公网实例后再去配置个人网页 Token。
 
@@ -89,6 +89,8 @@ Render 的 `autoDeploy: true` 会自动重新部署。
 | 一直弹密码 / 401 | 浏览器缓存了旧的 Basic Auth，换无痕窗口；或到 Render 环境变量里改 `ACCESS_PASSWORD` |
 | 构建报 Node 版本错误 | 确认 `NODE_VERSION=24.22.1`，仓库根目录有 `.node-version` |
 | 网页登录态报 Node 不支持 WebSocket | Node 必须是 22+，本项目固定 24 |
+| StepFun 报 401 / token is illegal | `Oasis-Token` 的 access 段约 30 分钟过期，重新从 stepfun.com 复制完整值 |
+| StepFun 请求被 403/挑战 | 海外机房可能被 WAF 拦截，改用官方 API 或公益 Space |
 | 冷启动很慢 | 免费套餐休眠导致，属正常现象 |
 | 生成中途断开 | 服务端每 15 秒发心跳保活；检查 Render 日志里是否有上游报错 |
 | 作品重启后消失 | 免费套餐文件系统是临时的，需要挂 Disk 并设置 `CACHE_DIR` |

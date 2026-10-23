@@ -110,7 +110,11 @@
 
       <label for="mmWebToken">网页登录态 Token <span class="muted">实验性</span></label>
       <input id="mmWebToken" type="password" autocomplete="off" spellcheck="false" placeholder="eyJhbGciOi...（www.minimax.cn 的登录 token）">
-      <p class="tip"><b class="warn">非官方接口</b>：会消耗你网页账号的创作额度，Token 约 40 天过期，网站更新后可能失效。优先级：网页登录态 &gt; 官方 API Key &gt; 公益 Space。只在本机使用，不要把服务开到公网。</p>
+      <p class="tip"><b class="warn">非官方接口</b>：会消耗你网页账号的创作额度，Token 约 40 天过期，网站更新后可能失效。优先级：StepFun &gt; 网页登录态 &gt; 官方 API Key &gt; 公益 Space。只在本机使用，不要把服务开到公网。</p>
+
+      <label for="stepToken">StepFun 登录态 <span class="muted">实验性</span></label>
+      <input id="stepToken" type="password" autocomplete="off" spellcheck="false" placeholder="eyJ...（Oasis-Token，含 ... 分隔的两段）">
+      <p class="tip"><b class="warn">非官方接口</b>：消耗阶跃账号的音乐额度（当前账号共 10 次）；access token 约 30 分钟过期，过期后重新复制完整的 <code>Oasis-Token</code>（从 www.stepfun.com 的 Cookie 里取）。只在本机使用。</p>
 
       <hr class="quota-sep">
 
@@ -235,7 +239,7 @@
 </main>
 
 <footer>
-  <p>音乐由 <a href="https://huggingface.co/spaces/MiniMaxAI/MiniMax-Music3" target="_blank" rel="noopener">MiniMax Music 3</a>（网页登录态 / 官方接口 / 公开 Space）生成，歌词由 MiniMax 官方或 Pollinations 提供。请勿滥用。</p>
+  <p>音乐由 MiniMax Music 3 或 StepFun 阶跃生成，歌词由 MiniMax 官方 / Pollinations 或你自己提供。请勿滥用。</p>
   <p class="muted">本地运行 · 无需账号 · 音频仅保存在你自己的电脑上</p>
 </footer>
 
