@@ -698,7 +698,7 @@ async function runWebJob(job) {
         clearTimeout(timer);
         fn(arg);
       };
-      timer = setTimeout(() => done(reject, new Error('网页接口超时（15 分钟）')), 15 * 60 * 1000);
+      timer = setTimeout(() => done(reject, new Error('网页接口超时（10 分钟）')), 10 * 60 * 1000);
 
       ws.addEventListener('open', () => {
         if (job.canceled) return;

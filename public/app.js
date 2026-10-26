@@ -73,6 +73,7 @@
   let eventSource = null;
   let lastSeq = 0;
   let timerHandle = null;
+  let hardTimer = null;
   let timerStart = 0;
   let cancelRequested = false;
   let lyricAbort = null;
@@ -321,11 +322,22 @@
       el.elapsed.textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
     }, 1000);
     startVisualizer();
+
+    // 兜底：任何引擎超过 12 分钟都没结束，自动停表并提示
+    clearTimeout(hardTimer);
+    hardTimer = setTimeout(() => {
+      if (!busy) return;
+      if (currentJob) fetch(`/api/jobs/${currentJob}/cancel`, { method: 'POST' }).catch(() => {});
+      if (eventSource) { eventSource.close(); eventSource = null; }
+      showError('生成超过 12 分钟仍未完成，已自动停止。请重试，或换用其它引擎。');
+    }, 12 * 60 * 1000);
   }
 
   function stopGenerating() {
     clearInterval(timerHandle);
     timerHandle = null;
+    clearTimeout(hardTimer);
+    hardTimer = null;
     stopPseudoProgress();
     stopVisualizer();
   }
@@ -581,7 +593,7 @@
     if (currentEngine === 'web' || currentEngine === 'stepfun') {
       el.liveHint.textContent = currentEngine === 'stepfun'
         ? '阶跃音乐生成中，通常 1~3 分钟，完成后自动保存'
-        : '网页版生成中，通常 3~8 分钟，完成后自动保存';
+        : '网页版生成中，通常 3~8 分钟（超过 12 分钟会自动停止）';
       startPseudoProgress();
     } else {
       el.liveHint.textContent = '正在实时演唱，声音会随生成进度播放';
