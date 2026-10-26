@@ -112,9 +112,20 @@
     return /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(t);
   }
 
+  function stepTokenInfo() {
+    let raw = (el.stepToken.value || '').trim();
+    if (raw.includes('Oasis-Token=')) {
+      const m = raw.match(/Oasis-Token=([^;\s]+)/);
+      raw = m ? m[1] : '';
+      try { raw = decodeURIComponent(raw); } catch { /* 保持原样 */ }
+    }
+    const parts = raw.split('...');
+    const complete = parts.length === 2 && /^eyJ/.test(parts[0]) && /^eyJ/.test(parts[1]);
+    return { raw, complete };
+  }
+
   function hasStepToken() {
-    const t = (el.stepToken.value || '').trim();
-    return t.length > 80 && (t.includes('...') || t.includes('Oasis-Token='));
+    return stepTokenInfo().complete;
   }
 
   function stepReady() { return hasStepToken() || serverStepToken; }
@@ -156,12 +167,16 @@
   function updateEngineUI() {
     const engine = activeEngine();
     syncModelOptions(engine);
+    const stepInfo = stepTokenInfo();
+    const stepIncomplete = Boolean(stepInfo.raw) && !stepInfo.complete && !serverStepToken;
     const ready = engine === 'stepfun' ? stepReady() : webReady();
     if (el.engineNow) {
       if (engine === 'stepfun') {
         el.engineNow.innerHTML = ready
           ? '当前使用：<b>StepFun 阶跃</b> · step-music（消耗账号音乐额度）'
-          : '当前使用：<b>StepFun 阶跃</b> · 还没配置登录态';
+          : stepIncomplete
+            ? '当前使用：<b>StepFun 阶跃</b> · Token 不完整（需要 access...refresh 两段）'
+            : '当前使用：<b>StepFun 阶跃</b> · 还没配置登录态';
       } else {
         el.engineNow.innerHTML = ready
           ? `当前使用：<b>MiniMax 网页登录态</b> · ${webModelLabel()}（消耗网页创作额度）`
@@ -178,9 +193,10 @@
     }
     if (el.modeBadge) el.modeBadge.textContent = engine === 'stepfun' ? 'StepFun 登录态' : '网页登录态';
     const dot = el.engineStatus.querySelector('.dot');
-    if (dot) dot.className = 'dot ' + (ready ? 'ok' : 'wait');
+    const bad = engine === 'stepfun' && stepIncomplete;
+    if (dot) dot.className = 'dot ' + (ready ? 'ok' : bad ? 'bad' : 'wait');
     el.engineText.textContent = engine === 'stepfun'
-      ? (ready ? 'StepFun 登录态已配置' : '等待填入 StepFun Token')
+      ? (ready ? 'StepFun 登录态已配置' : bad ? 'StepFun Token 不完整' : '等待填入 StepFun Token')
       : (ready ? '网页登录态已配置' : '等待填入网页 Token');
   }
 
@@ -349,7 +365,10 @@
     const instrumental = el.instrumental.checked;
     const engine = activeEngine();
     if (engine === 'stepfun' && !stepReady()) {
-      toast('先填入 StepFun 登录态 Token');
+      const info = stepTokenInfo();
+      toast(info.raw
+        ? 'StepFun Token 不完整：需要完整的 Oasis-Token（access...refresh 两段）'
+        : '先填入 StepFun 登录态 Token');
       el.quotaBox.open = true;
       return;
     }
@@ -488,6 +507,10 @@
         if (msg.message) el.stageText.textContent = msg.message;
         const map = currentEngine === 'web' ? stageSubtitleWeb : stageSubtitleStepfun;
         if (msg.stage && map[msg.stage]) el.stageSub.textContent = map[msg.stage];
+      } else if (msg.type === 'token' && msg.stepToken) {
+        el.stepToken.value = msg.stepToken;
+        saveDraft();
+        updateEngineUI();
       } else if (msg.type === 'done') {
         es.close();
         if (eventSource === es) eventSource = null;
