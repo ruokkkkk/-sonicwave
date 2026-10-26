@@ -561,9 +561,7 @@
     const engineLabel = meta?.engine === 'stepfun' ? 'StepFun 阶跃'
       : meta?.engine === 'web' ? 'MiniMax 网页' : '旧版 Space';
     el.songMeta.textContent = `${meta?.duration || 0} 秒 · ${fmt} · 44.1kHz · ${engineLabel}`;
-    el.resultLyrics.textContent = (meta?.lyrics && !/[instrumental]/i.test(meta.lyrics || ''))
-      ? meta.lyrics
-      : '纯音乐作品，无人声。';
+    el.resultLyrics.textContent = isInstrumentalSong(meta) ? '纯音乐作品，无人声。' : meta.lyrics;
 
     // 封面配色随歌名变化
     const [c1, c2] = paletteFor(title);
@@ -617,6 +615,11 @@
       node.style.backgroundImage = '';
       node.classList.remove('has-art');
     }
+  }
+
+  function isInstrumentalSong(meta) {
+    const lyrics = String(meta?.lyrics || '').trim();
+    return Boolean(meta?.instrumental) || !lyrics || /^\[instrumental\]$/i.test(lyrics);
   }
 
   function paletteFor(text) {
@@ -789,7 +792,7 @@
     const itemEngine = item.engine === 'stepfun' ? 'StepFun 阶跃'
       : item.engine === 'web' ? 'MiniMax 网页' : '旧版 Space';
     el.songMeta.textContent = `${item.duration || 0} 秒 · ${itemFmt} · 44.1kHz · ${itemEngine}`;
-    el.resultLyrics.textContent = item.lyrics && !/[instrumental]/i.test(item.lyrics || '') ? item.lyrics : '纯音乐作品，无人声。';
+    el.resultLyrics.textContent = isInstrumentalSong(item) ? '纯音乐作品，无人声。' : item.lyrics;
     const [c1, c2] = paletteFor(item.title || '');
     el.cover.style.setProperty('--c1', c1);
     el.cover.style.setProperty('--c2', c2);

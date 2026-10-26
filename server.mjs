@@ -791,8 +791,8 @@ async function runWebJob(job) {
  * 引擎 D：StepFun 阶跃音乐（网页登录态，非官方接口）
  * Oasis-Token 的格式是 <access>...<refresh>，用 RefreshToken 换新 access。
  * ------------------------------------------------------------------ */
-function stepCookie(access, refresh, webid) {
-  return `Oasis-Webid=${webid}; Oasis-appID=10200; Oasis-Platform=web; Oasis-Token=${access}...${refresh}`;
+function stepCookie(access, refresh, webid, appId = 10200) {
+  return `Oasis-Webid=${webid}; Oasis-appID=${appId}; Oasis-Platform=web; Oasis-Token=${access}...${refresh}`;
 }
 
 function parseStepToken(raw) {
@@ -816,16 +816,17 @@ function parseStepToken(raw) {
   const payload = jwtPayload(refresh);
   webid = webid || String(payload?.device_id || '');
   if (!webid) return null;
-  return { access, refresh, webid, token: text };
+  const appId = Number(payload?.app_id) || 10200;
+  return { access, refresh, webid, appId, token: text };
 }
 
-async function stepPost(pathname, body, cookie, timeout = 60000) {
+async function stepPost(pathname, body, cookie, timeout = 60000, appId = 10200) {
   const res = await requestFollow(STEP_BASE + pathname, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       'connect-protocol-version': '1',
-      'oasis-appid': '10200',
+      'oasis-appid': String(appId),
       'oasis-platform': 'web',
       origin: 'https://www.stepfun.com',
       referer: 'https://www.stepfun.com/studio/audio?tab=music',
@@ -847,9 +848,10 @@ async function stepPost(pathname, body, cookie, timeout = 60000) {
 }
 
 async function stepRefresh(parsed) {
-  const cookie = stepCookie(parsed.access, parsed.refresh, parsed.webid);
+  const appId = parsed.appId || 10200;
+  const cookie = stepCookie(parsed.access, parsed.refresh, parsed.webid, appId);
   const data = await stepPost(
-    '/passport/proto.api.passport.v1.PassportService/RefreshToken', {}, cookie, 30000
+    '/passport/proto.api.passport.v1.PassportService/RefreshToken', {}, cookie, 30000, appId
   );
   const access = data?.accessToken?.raw;
   const refresh = data?.refreshToken?.raw || parsed.refresh;
@@ -863,7 +865,7 @@ async function stepRefresh(parsed) {
       && String(accessPayload.oasis_id) !== String(refreshPayload.oasis_id)) {
     throw new Error('StepFun 登录态不匹配（access 与 refresh 不是同一次登录）');
   }
-  return { cookie: stepCookie(access, refresh, parsed.webid), access, refresh };
+  return { cookie: stepCookie(access, refresh, parsed.webid, appId), access, refresh, appId };
 }
 
 
@@ -883,9 +885,10 @@ async function runStepfunJob(job) {
       broadcast(job, { type: 'token', stepToken: freshToken });
     }
     const cookie = session.cookie;
+    const appId = session.appId || parsed.appId || 10200;
 
     try {
-      const quota = await stepPost('/api/audio/capy.audio.v1.AudioService/GetQuota', {}, cookie, 20000);
+      const quota = await stepPost('/api/audio/capy.audio.v1.AudioService/GetQuota', {}, cookie, 20000, appId);
       const remaining = Number(quota?.musicQuota?.remainingQuota);
       if (Number.isFinite(remaining) && remaining <= 0) throw new Error('StepFun 音乐额度已用完');
     } catch (e) {
@@ -907,7 +910,7 @@ async function runStepfunJob(job) {
 
     setStage(job, 'submitting', '正在提交到 StepFun 阶跃音乐…');
     const submit = await stepPost(
-      '/api/audio/capy.audio.v1.AudioService/SubmitMusicTask', body, cookie, 60000
+      '/api/audio/capy.audio.v1.AudioService/SubmitMusicTask', body, cookie, 60000, appId
     );
     const taskId = submit?.taskId;
     if (!taskId) throw new Error('StepFun 没有返回任务号');
@@ -924,7 +927,8 @@ async function runStepfunJob(job) {
         '/api/audio/capy.audio.v1.AudioService/GetMusicTask',
         { taskId, withAudioB64: false },
         cookie,
-        30000
+        30000,
+        appId
       );
       record = result?.musicRecord || null;
       const status = record?.status;
