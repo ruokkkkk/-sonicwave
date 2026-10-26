@@ -14,6 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execSync, execFileSync, spawn } from 'node:child_process';
+import { Readable } from 'node:stream';
 import os from 'node:os';
 import dns from 'node:dns';
 
@@ -32,7 +33,6 @@ const IS_RENDER = process.env.RENDER === 'true' || Boolean(process.env.RENDER_SE
 const PORT = Number(process.env.SONICWAVE_PORT) || (IS_RENDER ? Number(process.env.PORT) || 10000 : 8899);
 const HOST = process.env.HOST || (IS_RENDER ? '0.0.0.0' : '127.0.0.1');
 const ACCESS_PASSWORD = (process.env.ACCESS_PASSWORD || '').trim();
-const SPACE = 'https://minimaxai-minimax-music3.hf.space';
 const POLLINATIONS = 'https://text.pollinations.ai';
 const MM_WEB_TOKEN = (process.env.MM_WEB_TOKEN || '').trim();
 const MM_WEB_OP_TICKET = (process.env.MM_WEB_OP_TICKET || '').trim();
@@ -42,10 +42,6 @@ const STEP_BASE = 'https://www.stepfun.com';
 const STEP_TOKEN = (process.env.STEP_TOKEN || '').trim();
 const STEP_MODEL = 'step-music';
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 2;
-const MAX_DURATION = 180;
-const MIN_DURATION = 30;
-const MAX_LIVE_CHUNK_BYTES = 64 * 1024 * 1024;
-const DEFAULT_HF_TOKEN = (process.env.HF_TOKEN || '').trim();
 const JOB_TTL_MS = 45 * 60 * 1000;
 
 const log = (...a) => console.log('[声浪]', new Date().toLocaleTimeString('zh-CN'), ...a);
@@ -276,13 +272,16 @@ function parseHttpHeader(text) {
 
 function curlRequest(urlStr, { method = 'GET', headers = {}, body = null, timeout = 60000, useProxy = true } = {}) {
   return new Promise((resolve, reject) => {
-    const headerFile = path.join(os.tmpdir(), `sonicwave-h-${crypto.randomBytes(6).toString('hex')}`);
-    const args = ['-sS', '-N', '--http1.1', '--suppress-connect-headers', '--connect-timeout', '15', '-D', headerFile, '-X', method];
+    const token = crypto.randomBytes(6).toString('hex');
+    const headerFile = path.join(os.tmpdir(), `sonicwave-h-${token}`);
+    const bodyFile = path.join(os.tmpdir(), `sonicwave-b-${token}`);
+    const args = ['-sS', '--http1.1', '--suppress-connect-headers', '--connect-timeout', '15',
+      '-D', headerFile, '-o', bodyFile, '-X', method];
     if (timeout) args.push('--max-time', String(Math.ceil(timeout / 1000) + 5));
     if (useProxy && PROXY && proxyReady()) args.push('-x', `http://${PROXY.host}:${PROXY.port}`);
     for (const [k, v] of Object.entries(headers)) {
       const key = k.toLowerCase();
-      if (key === 'host' || key === 'content-length') continue; // 交给 curl 计算
+      if (key === 'host' || key === 'content-length') continue;
       args.push('-H', `${k}: ${v}`);
     }
     if (body != null) args.push('--data-binary', '@-');
@@ -295,57 +294,51 @@ function curlRequest(urlStr, { method = 'GET', headers = {}, body = null, timeou
       return reject(e);
     }
 
-    const out = child.stdout;
-    out.pause();
-    // 防止在调用方尚未挂监听时（超时/取消）产生未捕获的 stream error
-    out.on('error', () => {});
-    child.stdin.on('error', () => {});
     let stderr = '';
-    let done = false;
-    let poll = null;
+    let settled = false;
     let hard = null;
-    const cleanup = () => { try { fs.unlinkSync(headerFile); } catch {} };
-    const attach = (status, hdrs) => {
-      out.statusCode = status;
-      out.headers = hdrs;
-      const origDestroy = out.destroy.bind(out);
-      out.destroy = (err) => { try { child.kill(); } catch {} return origDestroy(err); };
+    const cleanup = () => {
+      try { fs.unlinkSync(headerFile); } catch {}
+      try { fs.unlinkSync(bodyFile); } catch {}
     };
     const finish = (err, res) => {
-      if (done) return;
-      done = true;
-      clearInterval(poll);
+      if (settled) return;
+      settled = true;
       clearTimeout(hard);
-      if (err) { try { child.kill(); } catch {} cleanup(); reject(err); return; }
-      resolve(res); // 不解流，交给消费方 on('data')/pipe 自动恢复
+      if (err) {
+        try { child.kill(); } catch {}
+        cleanup();
+        reject(err);
+        return;
+      }
+      resolve(res);
     };
-
-    poll = setInterval(() => {
-      let text = '';
-      try { text = fs.readFileSync(headerFile, 'latin1'); } catch { return; }
-      if (!/\r?\n\r?\n\s*$/.test(text)) return;
-      const { status, headers: hdrs } = parseHttpHeader(text);
-      if (!status || status === 100) return;
-      // 代理 CONNECT 的 "200 Connection established" 没有头部，不能当成最终响应
-      if (status === 200 && Object.keys(hdrs).length === 0) return;
-      attach(status, hdrs);
-      finish(null, out);
-    }, 20);
 
     hard = setTimeout(() => finish(new Error('请求超时')), timeout ? timeout + 8000 : 20 * 60 * 1000);
 
     child.stderr.on('data', d => { stderr += d.toString(); });
+    child.stdin.on('error', () => {});
     child.on('error', err => finish(err));
     child.on('exit', code => {
-      if (!done) {
-        let text = '';
-        try { text = fs.readFileSync(headerFile, 'latin1'); } catch {}
-        const { status, headers: hdrs } = text ? parseHttpHeader(text) : { status: 0, headers: {} };
-        if (status) { attach(status, hdrs); finish(null, out); }
-        else finish(new Error(stderr.trim() || `curl 退出码 ${code}`));
-      } else if (code !== 0) {
-        out.destroy(new Error(stderr.trim() || `curl 退出码 ${code}`));
+      if (settled) { cleanup(); return; }
+      let headerText = '';
+      let bodyBuf = Buffer.alloc(0);
+      try { headerText = fs.readFileSync(headerFile, 'latin1'); } catch {}
+      try { bodyBuf = fs.readFileSync(bodyFile); } catch {}
+      const parsed = headerText ? parseHttpHeader(headerText) : { status: 0, headers: {} };
+      if (!parsed.status) {
+        finish(new Error(stderr.trim() || `curl 退出码 ${code}`));
+        cleanup();
+        return;
       }
+      const stream = Readable.from([bodyBuf]);
+      stream.statusCode = parsed.status;
+      stream.headers = parsed.headers;
+      const origDestroy = stream.destroy.bind(stream);
+      stream.destroy = (err) => { try { child.kill(); } catch {} return origDestroy(err); };
+      resolve(stream);
+      settled = true;
+      clearTimeout(hard);
       cleanup();
     });
 
@@ -400,7 +393,7 @@ async function nodeRequest(urlStr, { method = 'GET', headers = {}, body = null, 
 }
 
 // 这些域名国内通常可直连，优先直连避免代理抖动拖慢
-const DIRECT_FIRST_HOSTS = ['text.pollinations.ai', 'www.stepfun.com', 'www.minimax.cn', 'api.minimax.cn'];
+const DIRECT_FIRST_HOSTS = ['text.pollinations.ai', 'www.minimax.cn', 'api.minimax.cn'];
 
 async function request(urlStr, opts = {}) {
   refreshProxy();
@@ -980,7 +973,6 @@ function sseSend(res, obj) {
 }
 
 function broadcast(job, obj) {
-  if (obj.type === 'chunk') job.lastSeq = obj.seq;
   for (const client of job.clients) {
     try { sseSend(client, obj); } catch { job.clients.delete(client); }
   }
@@ -994,15 +986,7 @@ function setStage(job, stage, message, extra = {}) {
   log(`[${job.id.slice(0, 6)}] ${message}`);
 }
 
-function setProgress(job, ratio, seconds) {
-  const p = Math.max(0, Math.min(1, ratio));
-  if (p - job.progress < 0.003 && p < 1) return;
-  job.progress = p;
-  if (seconds != null) job.seconds = seconds;
-  broadcast(job, { type: 'progress', progress: p, seconds: job.seconds, duration: job.duration });
-}
-
-function createJob(input, hfToken = '', minimaxModel = '', mmWebToken = '', stepToken = '') {
+function createJob(input, engine, mmWebToken = '', stepToken = '', minimaxModel = '') {
   const id = crypto.randomBytes(8).toString('hex');
   const job = {
     id,
@@ -1013,18 +997,13 @@ function createJob(input, hfToken = '', minimaxModel = '', mmWebToken = '', step
     progress: 0,
     seconds: 0,
     duration: input.duration,
-    chunks: [],
-    chunkBytes: 0,
-    lastSeq: 0,
     clients: new Set(),
     canceled: false,
-    hfToken,
+    engine,
     minimaxModel,
     mmWebToken,
     stepToken,
-    engine: stepToken ? 'stepfun' : (mmWebToken ? 'web' : 'hf'),
     input,
-    wavUrl: null,
     audioUrl: null,
     error: null,
   };
@@ -1049,7 +1028,7 @@ function enqueue(job) {
 async function runJob(job) {
   if (job.engine === 'stepfun') return runStepfunJob(job);
   if (job.engine === 'web') return runWebJob(job);
-  return runHfJob(job);
+  failJob(job, new Error('未知的生成引擎'));
 }
 
 function baseMeta(job, extra) {
@@ -1076,8 +1055,6 @@ async function completeJob(job, meta) {
   setStage(job, 'done', '完成', { progress: 1 });
   for (const c of job.clients) { try { c.end(); } catch {} }
   job.clients.clear();
-  job.chunks = [];
-  job.chunkBytes = 0;
   log(`[${job.id.slice(0, 6)}] 完成：${meta.title} (${meta.duration}s)`);
 }
 
@@ -1091,71 +1068,6 @@ function failJob(job, err) {
   job.clients.clear();
 }
 
-/* ---------- 引擎 A：Hugging Face 公益 Space（匿名免费） ---------- */
-async function runHfJob(job) {
-  try {
-    const input = job.input;
-    const state = {
-      mode: 'studio',
-      description: input.instrumental
-        ? `${input.description || input.style || 'instrumental music'}\nInstrumental, no vocals.`
-        : (input.description || input.style || ''),
-      instrumental: Boolean(input.instrumental),
-      title: input.title || '',
-      lyrics: input.lyrics || '[instrumental]',
-      global_meta: input.style || 'pop, warm production, 100 BPM',
-      vocals: '',
-      arrangement: '',
-    };
-
-    setStage(job, 'submitting', '正在连接免费音源…');
-    const auth = job.hfToken ? { 'x-hf-authorization': `Bearer ${job.hfToken}` } : {};
-    const start = await fetchJson(`${SPACE}/gradio_api/call/studio_generate`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...auth },
-      body: JSON.stringify({
-        data: [state, input.duration, input.seed, true, 0, input.steps, 1.7],
-      }),
-      timeout: 60000,
-    });
-
-    if (!start.event_id) throw new Error('音源没有返回任务号（可能正在维护）');
-    job.eventId = start.event_id;
-    setStage(job, 'waiting', '已进入免费 GPU 队列，等待分配…');
-
-    const res = await requestFollow(
-      `${SPACE}/gradio_api/call/studio_generate/${start.event_id}`,
-      { headers: { accept: 'text/event-stream', ...auth }, timeout: 0 }
-    );
-    if (res.statusCode !== 200) {
-      const body = await readBody(res);
-      throw new Error(`音源事件流 ${res.statusCode}: ${body.slice(0, 200)}`);
-    }
-    job.upstreamRes = res;
-
-    const upstreamError = await consumeEvents(job, res);
-    if (job.canceled) return;
-    if (upstreamError) throw new Error(upstreamError);
-    if (!job.wavUrl) throw new Error('生成结束但没有收到音频文件');
-
-    setStage(job, 'downloading', '音频合成完成，正在保存…', { progress: 0.98 });
-    const wavPath = path.join(AUDIO_DIR, `${job.id}.wav`);
-    await downloadToFile(job.wavUrl, wavPath);
-    const stat = await fsp.stat(wavPath);
-
-    const meta = baseMeta(job, {
-      duration: Math.round(stat.size / (44100 * 4)),
-      requestedDuration: job.duration,
-      audio: `/api/audio/${job.id}.wav`,
-      format: 'wav',
-      bytes: stat.size,
-    });
-    await completeJob(job, meta);
-  } catch (err) {
-    failJob(job, err);
-  }
-}
-
 function friendlyError(msg) {
   if (/StepFun.*(unauthenticated|token is illegal|401)/i.test(msg)) return 'StepFun 登录态已失效，请重新登录 www.stepfun.com 后复制新的 Oasis-Token。';
   if (/StepFun 登录态已过期/.test(msg)) return 'StepFun 登录态已过期（access token 约 30 分钟），请重新复制完整的 Oasis-Token。';
@@ -1164,119 +1076,12 @@ function friendlyError(msg) {
   if (/StepFun 生成超时/.test(msg)) return 'StepFun 10 分钟没有返回结果，请重试。';
   if (/StepFun/.test(msg)) return 'StepFun 接口报错：' + msg.replace(/^StepFun\s*/, '');
   if (/MiniMax web 1004|login fail|unauthorized/i.test(msg)) return '网页登录态已失效，请重新登录 www.minimax.cn 后复制新的 token。';
-  if (/网页接口超时/.test(msg)) return '网页接口 15 分钟没有返回结果，可能排队或任务异常，请重试。';
+  if (/网页接口超时/.test(msg)) return '网页接口 10 分钟没有返回结果，可能排队或任务异常，请重试。';
   if (/网页接口断开/.test(msg)) return '网页接口连接被断开，请重试；如果反复失败，重新登录复制新 token。';
   if (/审核/.test(msg)) return '输入内容触发了平台审核，换个描述或歌词再试。';
   if (/网页接口没有返回可下载的音频/.test(msg)) return '网页接口没有返回音频，可能生成失败，请重试。';
-  if (/ZeroGPU|quota|exceeded your|runs limit/i.test(msg)) {
-    return '匿名免费额度已用完（每天约 2 分钟 GPU，24 小时后重置）。可在「提升额度」里填入免费的 Hugging Face Token，额度会提升到每天 5 分钟。';
-  }
-  if (/exceeded|quota/i.test(msg)) return '免费 GPU 额度暂时用完了，请稍后再试。';
-  if (/GPU|ZeroGPU|queue/i.test(msg)) return '免费 GPU 正在排队或繁忙，请稍后重试。';
-  if (/410|404|maintenance|维护/i.test(msg)) return '免费音源暂时不可用，请稍后重试。';
   if (/ECONN|ETIMEDOUT|请求超时|socket|network/i.test(msg)) return '网络连接失败，请检查代理后重试。';
   return msg;
-}
-
-function consumeEvents(job, res) {
-  return new Promise((resolve, reject) => {
-    let buf = '';
-    let upstreamError = null;
-
-    res.setEncoding('utf8');
-    res.on('data', chunk => {
-      buf += chunk;
-      let idx;
-      while ((idx = buf.indexOf('\n\n')) >= 0) {
-        const block = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const err = handleBlock(job, block);
-        if (err) upstreamError = err;
-      }
-    });
-    res.on('end', () => resolve(upstreamError));
-    res.on('error', reject);
-  });
-}
-
-function handleBlock(job, block) {
-  if (job.canceled) return null;
-  let event = 'message';
-  const dataLines = [];
-  for (const line of block.split('\n')) {
-    if (line.startsWith('event:')) event = line.slice(6).trim();
-    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
-  }
-  if (!dataLines.length) return null;
-
-  let data;
-  try { data = JSON.parse(dataLines.join('\n')); } catch { return null; }
-
-  if (event === 'error') {
-    if (typeof data === 'string') return data;
-    const detail = data?.error || data?.message || data?.title;
-    if (detail) return String(detail);
-    try { return JSON.stringify(data); } catch { return '音源返回错误'; }
-  }
-  if (!Array.isArray(data)) return null;
-
-  const [player, stats, file] = data;
-
-  if (player && typeof player === 'object') {
-    if (player.cmd === 'status') {
-      setStage(job, 'generating', translateStatus(player.text));
-    } else if (player.cmd === 'chunk' && player.pcm) {
-      handleChunk(job, player);
-    } else if (player.cmd === 'done') {
-      if (player.url && !job.wavUrl) job.wavUrl = new URL(player.url, SPACE).toString();
-      setProgress(job, 1);
-    }
-  }
-
-  if (file && file.url) job.wavUrl = file.url;
-
-  if (typeof stats === 'string') {
-    const m = stats.match(/([\d.]+)s of audio/);
-    if (m) {
-      const sec = parseFloat(m[1]);
-      job.seconds = sec;
-      if (job.status !== 'generating') setStage(job, 'generating', '正在演唱…');
-      setProgress(job, sec / Math.max(1, job.duration), sec);
-    }
-  }
-  return null;
-}
-
-function translateStatus(text) {
-  if (!text) return '正在生成…';
-  if (/Acquiring ZeroGPU|warming/i.test(text)) return '已分配到 GPU，正在调音…';
-  if (/composing|writing lyrics/i.test(text)) return '正在写词…';
-  if (/streaming/i.test(text)) return '正在演唱…';
-  if (/rendering/i.test(text)) return '正在收尾…';
-  if (/done/i.test(text)) return '完成';
-  return text;
-}
-
-function handleChunk(job, player) {
-  const seq = Number(player.seq) || 0;
-  if (seq && seq <= job.lastSeq) return;
-  if (job.status !== 'generating') setStage(job, 'generating', '正在演唱…');
-
-  if (job.chunkBytes < MAX_LIVE_CHUNK_BYTES) {
-    job.chunks.push({ seq, pcm: player.pcm, sr: player.sr || 44100, ch: player.ch || 2, off: player.off || 0 });
-    job.chunkBytes += player.pcm.length;
-  }
-  broadcast(job, {
-    type: 'chunk',
-    seq,
-    pcm: player.pcm,
-    sr: player.sr || 44100,
-    ch: player.ch || 2,
-  });
-
-  const sr = player.sr || 44100;
-  const seconds = ((player.off || 0) + ((player.pcm.length * 3) / 4 / 2)) / sr;
-  if (seconds) setProgress(job, seconds / Math.max(1, job.duration), seconds);
 }
 
 async function downloadToFile(url, dest) {
@@ -1350,12 +1155,6 @@ async function readJsonBody(req, limit = 1024 * 1024) {
   });
 }
 
-function clampInt(v, min, max, fallback) {
-  const n = Math.round(Number(v));
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, n));
-}
-
 function cleanText(v, max) {
   return String(v ?? '').replace(/\u0000/g, '').trim().slice(0, max);
 }
@@ -1427,29 +1226,13 @@ async function listLibrary() {
   return items.slice(0, 60);
 }
 
-async function proxyHealth() {
-  const started = Date.now();
-  try {
-    const res = await requestFollow('https://huggingface.co/api/spaces/MiniMaxAI/MiniMax-Music3', { timeout: 12000 });
-    await readBody(res, 256 * 1024);
-    // 429/401 也说明能连上，只是被限流
-    return { ok: res.statusCode < 500, latency: Date.now() - started, code: res.statusCode };
-  } catch (e) {
-    return { ok: false, latency: Date.now() - started, error: e.message };
-  }
-}
-
-let healthCache = { at: 0, value: null };
-
 async function handleApi(req, res, url) {
   const { pathname } = url;
 
   if (pathname === '/api/health' && req.method === 'GET') {
-    if (url.searchParams.has('fresh') || Date.now() - healthCache.at > 30000) {
-      healthCache = { at: Date.now(), value: await proxyHealth() };
-    }
     return json(res, 200, {
-      ...healthCache.value,
+      ok: true,
+      uptime: Math.round(process.uptime()),
       proxy: PROXY ? `${PROXY.host}:${PROXY.port}` : null,
       proxyMode: PROXY ? (proxyReady() ? 'proxy' : 'direct-fallback') : 'direct',
       running,
@@ -1459,21 +1242,17 @@ async function handleApi(req, res, url) {
 
   if (pathname === '/api/config' && req.method === 'GET') {
     return json(res, 200, {
-      engine: 'MiniMax Music 3',
-      maxDuration: MAX_DURATION,
-      minDuration: MIN_DURATION,
-      hasServerToken: Boolean(DEFAULT_HF_TOKEN),
+      engines: ['stepfun', 'web'],
       hasWebToken: Boolean(MM_WEB_TOKEN),
       hasStepToken: Boolean(STEP_TOKEN),
       stepModel: STEP_MODEL,
       webModels: MM_WEB_MODELS,
-      anonymousQuotaHint: '匿名额度每天约 2 分钟 GPU；免费 HF Token 为每天 5 分钟',
     });
   }
 
   if (pathname === '/api/lyrics' && req.method === 'POST') {
     const body = await readJsonBody(req);
-    const duration = clampInt(body.duration, MIN_DURATION, MAX_DURATION, 60);
+    const duration = 60;
     const description = cleanText(body.description, 600);
     const style = cleanText(body.style, 240);
     const instrumental = Boolean(body.instrumental);
@@ -1483,13 +1262,13 @@ async function handleApi(req, res, url) {
         title: cleanText(body.title, 40) || description.slice(0, 16) || '纯音乐',
         lyrics: '[instrumental]',
         style,
-        engine: 'hf',
+        engine: 'pollinations',
       });
     }
 
     try {
       const result = await writeLyrics({ description, style, instrumental, duration });
-      return json(res, 200, { ...result, engine: 'hf' });
+      return json(res, 200, { ...result, engine: 'pollinations' });
     } catch (e) {
       log('写词失败：', e.message);
       return json(res, 502, { error: '歌词生成失败：' + friendlyError(e.message) });
@@ -1504,10 +1283,18 @@ async function handleApi(req, res, url) {
     if (!description && !lyrics && !body.style) {
       return json(res, 400, { error: '至少写点描述或歌词吧' });
     }
+    let engine = body.engine === 'web' ? 'web' : body.engine === 'stepfun' ? 'stepfun' : '';
     const minimaxModel = cleanText(body.minimaxModel, 40);
     const mmWebToken = pickWebToken(body.mmWebToken);
     const stepToken = pickStepToken(body.stepToken);
-    if (!instrumental && lyrics.length < 10 && !mmWebToken && !stepToken) {
+    if (!engine) engine = stepToken ? 'stepfun' : 'web';
+    if (engine === 'web' && !mmWebToken) {
+      return json(res, 400, { error: '请先填入 MiniMax 网页登录态 Token' });
+    }
+    if (engine === 'stepfun' && !stepToken) {
+      return json(res, 400, { error: '请先填入 StepFun 登录态 Token' });
+    }
+    if (!instrumental && lyrics.length < 10) {
       return json(res, 400, { error: '歌词太短了，至少写几句' });
     }
     const input = {
@@ -1515,16 +1302,12 @@ async function handleApi(req, res, url) {
       description,
       lyrics: instrumental ? '[instrumental]' : lyrics,
       style: cleanText(body.style, 300) || 'pop, warm production, 100 BPM',
-      duration: clampInt(body.duration, MIN_DURATION, MAX_DURATION, 60),
-      steps: clampInt(body.steps, 4, 60, 30),
+      duration: 60,
       instrumental,
-      seed: crypto.randomInt(1, 2147483647),
     };
-    const rawToken = cleanText(body.hfToken, 200);
-    const hfToken = /^(hf_|api_)[A-Za-z0-9_-]{10,}$/.test(rawToken) ? rawToken : DEFAULT_HF_TOKEN;
-    const job = createJob(input, hfToken, minimaxModel, mmWebToken, stepToken);
+    const job = createJob(input, engine, mmWebToken, stepToken, minimaxModel);
     enqueue(job);
-    log(`[${job.id.slice(0, 6)}] 新任务（${job.engine}${job.engine === 'web' ? ' / ' + job.minimaxModel : ''}）：${input.title} / ${input.duration}s / ${input.style}`);
+    log(`[${job.id.slice(0, 6)}] 新任务（${job.engine}${job.engine === 'web' ? ' / ' + job.minimaxModel : ''}）：${input.title} / ${input.style}`);
     return json(res, 200, { id: job.id, status: job.status, engine: job.engine });
   }
 
@@ -1537,7 +1320,6 @@ async function handleApi(req, res, url) {
     if (action === '/cancel' && req.method === 'POST') {
       job.canceled = true;
       job.status = 'canceled';
-      try { job.upstreamRes?.destroy(); } catch {}
       try {
         if (job.webSocket) {
           try { job.webSocket.send(JSON.stringify({ method: 'StopMusicGen', payload: {}, msg_id: crypto.randomUUID() })); } catch {}
@@ -1564,9 +1346,6 @@ async function handleApi(req, res, url) {
         type: 'status', stage: job.stage, message: job.message,
         progress: job.progress, status: job.status, engine: job.engine,
       });
-      for (const c of job.chunks) {
-        sseSend(res, { type: 'chunk', seq: c.seq, pcm: c.pcm, sr: c.sr, ch: c.ch });
-      }
       if (job.status === 'done' && job.meta) {
         sseSend(res, { type: 'done', meta: job.meta, audioUrl: job.audioUrl });
         res.end();
@@ -1638,10 +1417,6 @@ const server = http.createServer(async (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs) {
-    if (job.status === 'done' || job.status === 'error' || job.status === 'canceled') {
-      job.chunks = [];
-      job.chunkBytes = 0;
-    }
     if (now - job.createdAt > JOB_TTL_MS && job.clients.size === 0) jobs.delete(id);
   }
 }, 5 * 60 * 1000).unref();
@@ -1666,5 +1441,5 @@ server.listen(PORT, HOST, () => {
   log(`服务已启动 →  http://${HOST}:${PORT}`);
   log(`网络模式：${PROXY ? `代理 ${PROXY.host}:${PROXY.port}（失败会自动切换/探测）` : IS_RENDER ? '直连（Render 云上）' : '未检测到代理，正在探测本机常见端口…'}`);
   log(`监听：${HOST}:${PORT}${ACCESS_PASSWORD ? ' · 已开启访问密码' : ''}${IS_RENDER ? ' · Render' : ''}`);
-  log('引擎：StepFun / MiniMax 网页登录态 / 公益 Space');
+  log('引擎：StepFun / MiniMax 网页登录态（页面可切换）');
 });

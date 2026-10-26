@@ -15,19 +15,13 @@
     title: $('#title'),
     lyrics: $('#lyrics'),
     styleCustom: $('#styleCustom'),
-    duration: $('#duration'),
-    durationOut: $('#durationOut'),
-    quality: $('#quality'),
-    hfToken: $('#hfToken'),
     minimaxModel: $('#minimaxModel'),
     mmWebToken: $('#mmWebToken'),
     stepToken: $('#stepToken'),
     modelTip: $('#modelTip'),
     engineNow: $('#engineNow'),
-    durationField: $('#durationField'),
-    durationNote: $('#durationNote'),
+    engineSelect: $('#engineSelect'),
     quotaBox: $('#quotaBox'),
-    quotaEstimate: $('#quotaEstimate'),
     instrumental: $('#instrumental'),
     generate: $('#generate'),
     empty: $('#empty'),
@@ -71,7 +65,6 @@
   let busy = false;
   let currentJob = null;
   let eventSource = null;
-  let lastSeq = 0;
   let timerHandle = null;
   let hardTimer = null;
   let timerStart = 0;
@@ -80,84 +73,10 @@
   let rafHandle = null;
   let currentMeta = null;
   let seekDragging = false;
-  let currentEngine = 'hf';
+  let currentEngine = 'stepfun';
+  let serverWebToken = false;
+  let serverStepToken = false;
   let pseudoTimer = null;
-
-  /* ------------------------------------------------------------------ *
-   * 实时播放：把服务端转发的 PCM 块排队喂给 Web Audio
-   * ------------------------------------------------------------------ */
-  const StreamPlayer = {
-    ctx: null,
-    analyser: null,
-    sources: new Set(),
-    nextTime: 0,
-    sampleRate: 0,
-
-    ensureContext(sr = 44100) {
-      if (!this.ctx) {
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (!AC) return null;
-        try {
-          this.ctx = new AC({ sampleRate: sr });
-        } catch {
-          this.ctx = new AC();
-        }
-        this.analyser = this.ctx.createAnalyser();
-        this.analyser.fftSize = 512;
-        this.analyser.smoothingTimeConstant = 0.82;
-        this.analyser.connect(this.ctx.destination);
-        this.sampleRate = this.ctx.sampleRate;
-      }
-      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
-      return this.ctx;
-    },
-
-    push(base64, sr, channels) {
-      try {
-        const ctx = this.ensureContext(sr || 44100);
-        if (!ctx) return;
-        const ch = Math.max(1, Math.min(2, channels || 2));
-        const bin = atob(base64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        const view = new DataView(bytes.buffer);
-        const frames = Math.floor(bin.length / (2 * ch));
-        if (!frames) return;
-
-        const buffer = ctx.createBuffer(ch, frames, sr || ctx.sampleRate);
-        for (let c = 0; c < ch; c++) {
-          const out = buffer.getChannelData(c);
-          for (let i = 0; i < frames; i++) {
-            out[i] = view.getInt16((i * ch + c) * 2, true) / 32768;
-          }
-        }
-
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(this.analyser);
-        const when = Math.max(this.nextTime, ctx.currentTime + 0.05);
-        src.start(when);
-        this.nextTime = when + buffer.duration;
-        this.sources.add(src);
-        src.onended = () => this.sources.delete(src);
-      } catch (err) {
-        console.warn('音频块解码失败', err);
-      }
-    },
-
-    stop() {
-      for (const src of this.sources) {
-        try { src.stop(); } catch { /* 已结束 */ }
-      }
-      this.sources.clear();
-      this.nextTime = 0;
-    },
-
-    reset() {
-      this.stop();
-      this.nextTime = 0;
-    },
-  };
 
   /* ------------------------------------------------------------------ *
    * 界面基础
@@ -196,10 +115,11 @@
     return t.length > 80 && (t.includes('...') || t.includes('Oasis-Token='));
   }
 
+  function stepReady() { return hasStepToken() || serverStepToken; }
+  function webReady() { return hasWebToken() || serverWebToken; }
+
   function activeEngine() {
-    if (hasStepToken()) return 'stepfun';
-    if (hasWebToken()) return 'web';
-    return 'hf';
+    return el.engineSelect.value === 'web' ? 'web' : 'stepfun';
   }
 
   function webModelLabel() {
@@ -207,9 +127,6 @@
     return ['music-3.0', 'music-2.6'].includes(m) ? m : 'music-3.0';
   }
 
-  const HF_MODEL_OPTIONS = [
-    ['', '公益 Space · 固定模型'],
-  ];
   const WEB_MODEL_OPTIONS = [
     ['music-3.0', 'music-3.0 · 网页版'],
     ['music-2.6', 'music-2.6 · 网页版'],
@@ -219,9 +136,7 @@
   ];
 
   function syncModelOptions(engine) {
-    const want = engine === 'web' ? WEB_MODEL_OPTIONS
-      : engine === 'stepfun' ? STEPFUN_MODEL_OPTIONS
-        : HF_MODEL_OPTIONS;
+    const want = engine === 'web' ? WEB_MODEL_OPTIONS : STEPFUN_MODEL_OPTIONS;
     const sig = want.map(x => x[0]).join(',');
     if (el.minimaxModel.dataset.sig === sig) return;
     const current = el.minimaxModel.value;
@@ -239,70 +154,39 @@
   function updateEngineUI() {
     const engine = activeEngine();
     syncModelOptions(engine);
+    const ready = engine === 'stepfun' ? stepReady() : webReady();
     if (el.engineNow) {
       if (engine === 'stepfun') {
-        el.engineNow.innerHTML = '当前使用：<b>StepFun 阶跃</b> · step-music（消耗账号音乐额度）';
-      } else if (engine === 'web') {
-        el.engineNow.innerHTML = `当前使用：<b>网页登录态</b> · ${webModelLabel()}（消耗网页创作额度）`;
+        el.engineNow.innerHTML = ready
+          ? '当前使用：<b>StepFun 阶跃</b> · step-music（消耗账号音乐额度）'
+          : '当前使用：<b>StepFun 阶跃</b> · 还没配置登录态';
       } else {
-        el.engineNow.innerHTML = '当前使用：<b>公益免费 Space</b> · 无需 Key';
+        el.engineNow.innerHTML = ready
+          ? `当前使用：<b>MiniMax 网页登录态</b> · ${webModelLabel()}（消耗网页创作额度）`
+          : '当前使用：<b>MiniMax 网页登录态</b> · 还没配置登录态';
       }
     }
-    const fixedLength = engine === 'web' || engine === 'stepfun';
-    if (el.minimaxModel) el.minimaxModel.disabled = engine === 'hf';
-    if (el.durationField) el.durationField.classList.toggle('is-disabled', fixedLength);
-    el.duration.disabled = fixedLength;
-    el.quality.disabled = fixedLength;
-    if (el.durationNote) {
-      el.durationNote.textContent = engine === 'stepfun' ? '阶跃按歌词长度决定时长'
-        : engine === 'web' ? '网页版按歌词/描述决定时长' : '';
-    }
-    if (el.quotaEstimate) el.quotaEstimate.style.display = engine === 'hf' ? '' : 'none';
+    if (el.minimaxModel) el.minimaxModel.disabled = false;
     if (el.modelTip) {
       el.modelTip.textContent = engine === 'stepfun'
         ? '阶跃使用固定模型 step-music，按账号的音乐生成额度计费。'
-        : engine === 'web'
-          ? '网页登录态使用正式模型，按网页账号的创作次数计费。'
-          : '公益 Space 固定使用 MiniMax Music 3 公开模型；填入 Token 后会切换可选模型。';
+        : '网页登录态使用正式模型，按网页账号的创作次数计费。';
     }
-    if (el.modeBadge) {
-      el.modeBadge.textContent = engine === 'stepfun' ? 'StepFun 登录态'
-        : engine === 'web' ? '网页登录态' : '免登录 · 免费';
-    }
+    if (el.modeBadge) el.modeBadge.textContent = engine === 'stepfun' ? 'StepFun 登录态' : '网页登录态';
     const dot = el.engineStatus.querySelector('.dot');
-    if (engine !== 'hf') {
-      if (dot) dot.className = 'dot ok';
-      el.engineText.textContent = engine === 'stepfun' ? 'StepFun 登录态已配置'
-        : '网页登录态已配置';
-    } else {
-      if (dot) dot.className = 'dot wait';
-      el.engineText.textContent = '检测音源…';
-      clearTimeout(updateEngineUI._h);
-      updateEngineUI._h = setTimeout(checkHealth, 500);
-    }
+    if (dot) dot.className = 'dot ' + (ready ? 'ok' : 'wait');
+    el.engineText.textContent = engine === 'stepfun'
+      ? (ready ? 'StepFun 登录态已配置' : '等待填入 StepFun Token')
+      : (ready ? '网页登录态已配置' : '等待填入网页 Token');
   }
 
-  // 估算本次生成会消耗多少 ZeroGPU 额度（官方 Space 的 get_duration × xlarge 2 倍）
-  function updateQuotaEstimate() {
-    if (!el.quotaEstimate) return;
-    const d = +el.duration.value;
-    const steps = +el.quality.value;
-    const gpu = Math.round((0.75 * d + 0.2 * d * (steps / 30) + 15) * 2);
-    let hint;
-    if (gpu <= 120) hint = `匿名每日 120 秒约可生成 ${Math.max(1, Math.floor(120 / gpu))} 首`;
-    else if (gpu <= 300) hint = '超过匿名额度，需填入 Token（每天 300 秒）';
-    else hint = '超过 Token 每日额度，建议缩短时长';
-    el.quotaEstimate.innerHTML = `本次预计消耗 <b>≈ ${gpu} 秒</b> GPU 额度 · ${hint}`;
-  }
-
-  function updateRangeFill() {
-    const min = +el.duration.min;
-    const max = +el.duration.max;
-    const val = +el.duration.value;
-    const pct = ((val - min) / (max - min)) * 100;
-    el.duration.style.setProperty('--fill', pct + '%');
-    el.durationOut.textContent = val + ' 秒';
-    updateQuotaEstimate();
+  async function loadConfig() {
+    try {
+      const cfg = await (await fetch('/api/config')).json();
+      serverWebToken = Boolean(cfg.hasWebToken);
+      serverStepToken = Boolean(cfg.hasStepToken);
+    } catch { /* 忽略 */ }
+    updateEngineUI();
   }
 
   function showGenerating(title, sub) {
@@ -313,7 +197,7 @@
     el.stageText.textContent = title || '正在创作…';
     el.stageSub.textContent = sub || '';
     el.barFill.style.width = '0%';
-    el.progressText.textContent = '0 秒 / ' + el.duration.value + ' 秒';
+    el.progressText.textContent = '准备中…';
     el.elapsed.textContent = '00:00';
     timerStart = Date.now();
     clearInterval(timerHandle);
@@ -362,7 +246,6 @@
 
   function showError(message) {
     stopGenerating();
-    StreamPlayer.stop();
     el.generating.classList.add('is-hidden');
     el.result.classList.add('is-hidden');
     el.empty.classList.add('is-hidden');
@@ -374,7 +257,6 @@
 
   function backToEmpty() {
     stopGenerating();
-    StreamPlayer.stop();
     el.generating.classList.add('is-hidden');
     el.result.classList.add('is-hidden');
     el.errorCard.classList.add('is-hidden');
@@ -390,7 +272,6 @@
     const canvas = el.viz;
     const ctx2d = canvas.getContext('2d');
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const freq = new Uint8Array(256);
     const start = performance.now();
 
     const resize = () => {
@@ -409,12 +290,7 @@
       const H = canvas.height;
       ctx2d.clearRect(0, 0, W, H);
 
-      const analyser = StreamPlayer.analyser;
-      let hasSignal = false;
-      if (analyser) {
-        analyser.getByteFrequencyData(freq);
-        for (let i = 0; i < freq.length; i++) if (freq[i] > 8) { hasSignal = true; break; }
-      }
+      const hasSignal = false;
 
       const grad = ctx2d.createLinearGradient(0, 0, W, 0);
       grad.addColorStop(0, 'rgba(167,139,250,.95)');
@@ -466,11 +342,19 @@
    * ------------------------------------------------------------------ */
   async function startGeneration() {
     if (busy) return;
-    const duration = +el.duration.value;
-    const steps = +el.quality.value;
     const instrumental = el.instrumental.checked;
-
-    let payload = { duration, steps, instrumental };
+    const engine = activeEngine();
+    if (engine === 'stepfun' && !stepReady()) {
+      toast('先填入 StepFun 登录态 Token');
+      el.quotaBox.open = true;
+      return;
+    }
+    if (engine === 'web' && !webReady()) {
+      toast('先填入 MiniMax 网页登录态 Token');
+      el.quotaBox.open = true;
+      return;
+    }
+    let payload = { instrumental, engine };
 
     if (mode === 'simple') {
       const description = el.desc.value.trim();
@@ -493,14 +377,13 @@
       cancelRequested = false;
       setBusy(true);
       showGenerating('正在写词…', 'AI 作词人正在为你构思');
-      StreamPlayer.ensureContext();
       lyricAbort = new AbortController();
 
       try {
         const res = await fetch('/api/lyrics', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ description, style: payload.style, instrumental, duration }),
+          body: JSON.stringify({ description, style: payload.style, instrumental }),
           signal: lyricAbort.signal,
         });
         const data = await res.json().catch(() => ({}));
@@ -537,8 +420,7 @@
   }
 
   async function startJob(payload) {
-    const token = el.hfToken.value.trim();
-    if (token) payload.hfToken = token;
+    payload.engine = activeEngine();
     const webToken = el.mmWebToken.value.trim();
     if (webToken) payload.mmWebToken = webToken;
     const stepToken = el.stepToken.value.trim();
@@ -547,7 +429,6 @@
     cancelRequested = false;
     setBusy(true);
     showGenerating('正在提交…', '连接免费音源');
-    StreamPlayer.ensureContext();
     try {
       const res = await fetch('/api/generate', {
         method: 'POST',
@@ -572,32 +453,23 @@
     if (busy) return;
     if (!currentMeta) return startGeneration();
     if (eventSource) { eventSource.close(); eventSource = null; }
-    StreamPlayer.stop();
     el.result.classList.add('is-hidden');
     await startJob({
       title: currentMeta.title || '未命名作品',
       description: currentMeta.description || '',
       lyrics: currentMeta.lyrics || '',
       style: currentMeta.style || '',
-      duration: currentMeta.requestedDuration || currentMeta.duration || +el.duration.value,
-      steps: +el.quality.value,
       instrumental: Boolean(currentMeta.instrumental),
     });
   }
 
   function connectStream(jobId, engine) {
     currentJob = jobId;
-    lastSeq = 0;
-    currentEngine = engine || 'hf';
-    StreamPlayer.reset();
-    if (currentEngine === 'web' || currentEngine === 'stepfun') {
-      el.liveHint.textContent = currentEngine === 'stepfun'
-        ? '阶跃音乐生成中，通常 1~3 分钟，完成后自动保存'
-        : '网页版生成中，通常 3~8 分钟（超过 12 分钟会自动停止）';
-      startPseudoProgress();
-    } else {
-      el.liveHint.textContent = '正在实时演唱，声音会随生成进度播放';
-    }
+    currentEngine = engine === 'web' ? 'web' : 'stepfun';
+    el.liveHint.textContent = currentEngine === 'stepfun'
+      ? '阶跃音乐生成中，通常 1~3 分钟（超过 12 分钟会自动停止）'
+      : '网页版生成中，通常 3~8 分钟（超过 12 分钟会自动停止）';
+    startPseudoProgress();
     if (eventSource) eventSource.close();
 
     const es = new EventSource(`/api/jobs/${jobId}/stream`);
@@ -610,16 +482,8 @@
       if (msg.type === 'status') {
         if (msg.engine) currentEngine = msg.engine;
         if (msg.message) el.stageText.textContent = msg.message;
-        const map = currentEngine === 'stepfun' ? stageSubtitleStepfun
-          : currentEngine === 'web' ? stageSubtitleWeb : stageSubtitle;
+        const map = currentEngine === 'web' ? stageSubtitleWeb : stageSubtitleStepfun;
         if (msg.stage && map[msg.stage]) el.stageSub.textContent = map[msg.stage];
-        if (typeof msg.progress === 'number') setProgress(msg.progress, msg.seconds);
-      } else if (msg.type === 'progress') {
-        setProgress(msg.progress, msg.seconds);
-      } else if (msg.type === 'chunk') {
-        if (msg.seq && msg.seq <= lastSeq) return;
-        lastSeq = msg.seq || lastSeq;
-        StreamPlayer.push(msg.pcm, msg.sr, msg.ch);
       } else if (msg.type === 'done') {
         es.close();
         if (eventSource === es) eventSource = null;
@@ -632,20 +496,10 @@
     };
 
     es.onerror = () => {
-      // 浏览器会自动重连；若任务已结束，服务端会直接补发 done 并关闭。
       if (eventSource !== es) return;
       el.stageSub.textContent = '网络抖动，正在重连…';
     };
   }
-
-  const stageSubtitle = {
-    queued: '排队等待免费算力',
-    submitting: '正在连接免费音源',
-    waiting: '免费 GPU 排队中，请稍候',
-    generating: '实时演唱中，可以边听边等',
-    downloading: '正在保存音频',
-    done: '完成',
-  };
 
   const stageSubtitleStepfun = {
     queued: '等待阶跃接口',
@@ -665,17 +519,6 @@
     done: '完成',
   };
 
-  let lastProgress = 0;
-  function setProgress(ratio, seconds) {
-    if (currentEngine === 'web' || currentEngine === 'stepfun') return; // 无流式进度，交给伪进度
-    const pct = Math.max(0, Math.min(1, ratio || 0));
-    lastProgress = pct;
-    el.barFill.style.width = (pct * 100).toFixed(1) + '%';
-    const total = +el.duration.value;
-    const sec = seconds != null ? seconds : pct * total;
-    el.progressText.textContent = `${Math.max(0, sec).toFixed(0)} 秒 / ${total} 秒`;
-  }
-
   async function finish(meta, audioUrl) {
     stopGenerating();
     setBusy(false);
@@ -689,7 +532,7 @@
     el.songTitle.textContent = title;
     const fmt = String(meta?.format || (String(meta?.audio || '').endsWith('.mp3') ? 'mp3' : 'wav')).toUpperCase();
     const engineLabel = meta?.engine === 'stepfun' ? 'StepFun 阶跃'
-      : meta?.engine === 'web' ? 'MiniMax 网页' : '公益 Space';
+      : meta?.engine === 'web' ? 'MiniMax 网页' : '旧版 Space';
     el.songMeta.textContent = `${meta?.duration || 0} 秒 · ${fmt} · 44.1kHz · ${engineLabel}`;
     el.resultLyrics.textContent = (meta?.lyrics && !/[instrumental]/i.test(meta.lyrics || ''))
       ? meta.lyrics
@@ -788,7 +631,6 @@
       fetch(`/api/jobs/${currentJob}/cancel`, { method: 'POST' }).catch(() => {});
       currentJob = null;
     }
-    StreamPlayer.stop();
     backToEmpty();
     toast('已停止生成');
   }
@@ -798,7 +640,6 @@
    * ------------------------------------------------------------------ */
   function bindPlayer() {
     el.playBtn.addEventListener('click', async () => {
-      StreamPlayer.stop(); // 结束实时流，避免双重播放
       if (el.audio.paused) {
         try { await el.audio.play(); } catch (e) { toast('浏览器阻止了播放，请再点一次'); }
       } else {
@@ -904,7 +745,6 @@
   }
 
   function loadSong(item) {
-    StreamPlayer.stop();
     if (eventSource) { eventSource.close(); eventSource = null; }
     if (busy) {
       if (currentJob) fetch(`/api/jobs/${currentJob}/cancel`, { method: 'POST' }).catch(() => {});
@@ -920,7 +760,7 @@
     el.songTitle.textContent = item.title || '未命名作品';
     const itemFmt = String(item.format || (String(item.audio || '').endsWith('.mp3') ? 'mp3' : 'wav')).toUpperCase();
     const itemEngine = item.engine === 'stepfun' ? 'StepFun 阶跃'
-      : item.engine === 'web' ? 'MiniMax 网页' : '公益 Space';
+      : item.engine === 'web' ? 'MiniMax 网页' : '旧版 Space';
     el.songMeta.textContent = `${item.duration || 0} 秒 · ${itemFmt} · 44.1kHz · ${itemEngine}`;
     el.resultLyrics.textContent = item.lyrics && !/[instrumental]/i.test(item.lyrics || '') ? item.lyrics : '纯音乐作品，无人声。';
     const [c1, c2] = paletteFor(item.title || '');
@@ -949,37 +789,6 @@
   /* ------------------------------------------------------------------ *
    * 健康检查
    * ------------------------------------------------------------------ */
-  async function checkHealth() {
-    if (hasStepToken()) {
-      const dot = el.engineStatus.querySelector('.dot');
-      if (dot) dot.className = 'dot ok';
-      el.engineText.textContent = 'StepFun 登录态已配置';
-      return;
-    }
-    if (hasWebToken()) {
-      const dot = el.engineStatus.querySelector('.dot');
-      if (dot) dot.className = 'dot ok';
-      el.engineText.textContent = '网页登录态已配置';
-      return;
-    }
-    try {
-      const res = await fetch('/api/health');
-      const data = await res.json();
-      const dot = el.engineStatus.querySelector('.dot');
-      if (data.ok) {
-        dot.className = 'dot ok';
-        el.engineText.textContent = `免费音源在线 · ${data.latency}ms`;
-      } else {
-        dot.className = 'dot bad';
-        el.engineText.textContent = '音源离线 · 检查代理';
-      }
-    } catch {
-      const dot = el.engineStatus.querySelector('.dot');
-      dot.className = 'dot bad';
-      el.engineText.textContent = '无法连接本地服务';
-    }
-  }
-
   /* ------------------------------------------------------------------ *
    * 草稿保存 & 初始化
    * ------------------------------------------------------------------ */
@@ -993,10 +802,8 @@
         title: el.title.value,
         lyrics: el.lyrics.value,
         styleCustom: el.styleCustom.value,
-        duration: el.duration.value,
-        quality: el.quality.value,
         instrumental: el.instrumental.checked,
-        hfToken: el.hfToken.value,
+        engine: el.engineSelect.value,
         minimaxModel: el.minimaxModel.value,
         mmWebToken: el.mmWebToken.value,
         stepToken: el.stepToken.value,
@@ -1015,10 +822,8 @@
       el.title.value = d.title || '';
       el.lyrics.value = d.lyrics || '';
       el.styleCustom.value = d.styleCustom || '';
-      if (d.duration) el.duration.value = d.duration;
-      if (d.quality) el.quality.value = d.quality;
       el.instrumental.checked = Boolean(d.instrumental);
-      el.hfToken.value = d.hfToken || '';
+      if (d.engine === 'web' || d.engine === 'stepfun') el.engineSelect.value = d.engine;
       el.minimaxModel.value = d.minimaxModel || '';
       el.mmWebToken.value = d.mmWebToken || '';
       el.stepToken.value = d.stepToken || '';
@@ -1028,8 +833,6 @@
   function bind() {
     el.tabs.forEach(tab => tab.addEventListener('click', () => switchMode(tab.dataset.tab)));
 
-    el.duration.addEventListener('input', updateRangeFill);
-    el.quality.addEventListener('change', updateQuotaEstimate);
     el.instrumental.addEventListener('change', () => {
       if (el.instrumental.checked && mode === 'custom') {
         el.lyrics.placeholder = '纯音乐模式：歌词会被忽略';
@@ -1058,13 +861,14 @@
       }
     });
 
+    el.engineSelect.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
     el.minimaxModel.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
     el.mmWebToken.addEventListener('input', () => { updateEngineUI(); saveDraft(); });
     el.mmWebToken.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
     el.stepToken.addEventListener('input', () => { updateEngineUI(); saveDraft(); });
     el.stepToken.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
 
-    for (const input of [el.desc, el.styleSimple, el.title, el.lyrics, el.styleCustom, el.quality, el.hfToken, el.minimaxModel, el.mmWebToken, el.stepToken]) {
+    for (const input of [el.desc, el.styleSimple, el.title, el.lyrics, el.styleCustom, el.minimaxModel, el.mmWebToken, el.stepToken]) {
       input.addEventListener('input', saveDraft);
       input.addEventListener('change', saveDraft);
     }
@@ -1076,9 +880,7 @@
     bind();
     loadDraft();
     updateEngineUI();
-    updateRangeFill();
-    checkHealth();
-    setInterval(checkHealth, 60000);
+    loadConfig();
     loadLibrary();
   }
 

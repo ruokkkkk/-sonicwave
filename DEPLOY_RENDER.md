@@ -59,8 +59,8 @@ Render Dashboard → **New → Web Service** → 选仓库，然后：
 
 ## 网络
 
-- Render 在美国/新加坡，出网直连 Hugging Face 不需要代理；代码在 Render 上会跳过本机代理探测。
-- 网页登录态（`www.minimax.cn`）从海外访问通常可用，延迟会比国内高一些。如果发现网页引擎握手失败，先用 StepFun 或公益 Space。
+- Render 在美国/新加坡，出网访问 StepFun / MiniMax 均可；代码在 Render 上会跳过本机代理探测。
+- 网页登录态（`www.minimax.cn`）从海外访问通常可用，延迟会比国内高一些。StepFun 在海外可能被 WAF 拦截；如果阶跃握手失败，先切到 MiniMax 网页登录态。
 - 上游请求用系统自带 `curl`；Render 的 Node 镜像一般自带，缺失时会自动回退 Node 原生 HTTPS。
 
 ## 安全（重要）
@@ -90,7 +90,7 @@ Render 的 `autoDeploy: true` 会自动重新部署。
 | 构建报 Node 版本错误 | 确认 `NODE_VERSION=24.22.1`，仓库根目录有 `.node-version` |
 | 网页登录态报 Node 不支持 WebSocket | Node 必须是 22+，本项目固定 24 |
 | StepFun 报 401 / token is illegal | `Oasis-Token` 的 access 段约 30 分钟过期，重新从 stepfun.com 复制完整值 |
-| StepFun 请求被 403/挑战 | 海外机房可能被 WAF 拦截，改用 MiniMax 网页登录态或公益 Space |
+| StepFun 请求被 403/挑战 | 海外机房可能被 WAF 拦截，改用 MiniMax 网页登录态 |
 | 冷启动很慢 | 免费套餐休眠导致，属正常现象 |
 | 生成中途断开 | 服务端每 15 秒发心跳保活；检查 Render 日志里是否有上游报错 |
 | 作品重启后消失 | 免费套餐文件系统是临时的，需要挂 Disk 并设置 `CACHE_DIR` |
