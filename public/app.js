@@ -18,6 +18,8 @@
     minimaxModel: $('#minimaxModel'),
     mmWebToken: $('#mmWebToken'),
     stepToken: $('#stepToken'),
+    webTokenBox: $('#webTokenBox'),
+    stepTokenBox: $('#stepTokenBox'),
     modelTip: $('#modelTip'),
     engineNow: $('#engineNow'),
     engineSelect: $('#engineSelect'),
@@ -167,6 +169,8 @@
       }
     }
     if (el.minimaxModel) el.minimaxModel.disabled = false;
+    if (el.webTokenBox) el.webTokenBox.classList.toggle('is-hidden', engine !== 'web');
+    if (el.stepTokenBox) el.stepTokenBox.classList.toggle('is-hidden', engine !== 'stepfun');
     if (el.modelTip) {
       el.modelTip.textContent = engine === 'stepfun'
         ? '阶跃使用固定模型 step-music，按账号的音乐生成额度计费。'

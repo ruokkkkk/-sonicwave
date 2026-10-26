@@ -90,13 +90,17 @@
       </select>
       <p class="tip" id="modelTip">阶跃使用固定模型 step-music，按账号的音乐生成额度计费。</p>
 
-      <label for="mmWebToken">网页登录态 Token <span class="muted">实验性</span></label>
-      <input id="mmWebToken" type="password" autocomplete="off" spellcheck="false" placeholder="eyJhbGciOi...（www.minimax.cn 的登录 token）">
-      <p class="tip"><b class="warn">非官方接口</b>：会消耗你网页账号的创作额度，Token 约 40 天过期，网站更新后可能失效。引擎在上方切换；只在本机使用，不要把服务开到公网。</p>
+      <div id="webTokenBox">
+        <label for="mmWebToken">网页登录态 Token <span class="muted">实验性</span></label>
+        <input id="mmWebToken" type="password" autocomplete="off" spellcheck="false" placeholder="eyJhbGciOi...（www.minimax.cn 的登录 token）">
+        <p class="tip"><b class="warn">非官方接口</b>：会消耗你网页账号的创作额度，Token 约 40 天过期，网站更新后可能失效。引擎在上方切换；只在本机使用，不要把服务开到公网。</p>
+      </div>
 
-      <label for="stepToken">StepFun 登录态 <span class="muted">实验性</span></label>
-      <input id="stepToken" type="password" autocomplete="off" spellcheck="false" placeholder="eyJ...（Oasis-Token，含 ... 分隔的两段）">
-      <p class="tip"><b class="warn">非官方接口</b>：消耗阶跃账号的音乐额度（当前账号共 10 次）；access token 约 30 分钟过期，过期后重新复制完整的 <code>Oasis-Token</code>（从 www.stepfun.com 的 Cookie 里取）。只在本机使用。</p>
+      <div id="stepTokenBox">
+        <label for="stepToken">StepFun 登录态 <span class="muted">实验性</span></label>
+        <input id="stepToken" type="password" autocomplete="off" spellcheck="false" placeholder="eyJ...（Oasis-Token，含 ... 分隔的两段）">
+        <p class="tip"><b class="warn">非官方接口</b>：消耗阶跃账号的音乐额度（当前账号共 10 次）；access token 约 30 分钟过期，过期后重新复制完整的 <code>Oasis-Token</code>（从 www.stepfun.com 的 Cookie 里取）。只在本机使用。</p>
+      </div>
 
     </details>
 
