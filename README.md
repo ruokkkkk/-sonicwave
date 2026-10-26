@@ -1,21 +1,23 @@
 # 声浪 SonicWave · AI 歌曲生成
 
-参考 suno.cn 交互的本地网页：**输入一句话 → AI 写词 → 谱曲演唱 → 试听 → 下载**。四种引擎可选，默认无需登录、无需 Key 也能用。
+参考 suno.cn 交互的本地网页：**输入一句话 → AI 写词 → 谱曲演唱 → 试听 → 下载**。三种引擎可选，默认无需登录、无需 Key 也能用。
 
 ![界面预览](preview.png)
 
-## 四种引擎
+## 三种引擎
 
-| | StepFun 阶跃（实验性） | 网页登录态（实验性） | MiniMax 官方接口 | 公益免费 Space |
-| --- | --- | --- | --- | --- |
-| 触发条件 | 填入 www.stepfun.com 的 Oasis-Token | 填入 www.minimax.cn 的登录 Token | 填入 MiniMax API Key | 不填（默认） |
-| 写词 | 本地歌词 / Pollinations | 官方歌词接口 / Pollinations | 官方 `/v1/lyrics_generation`，失败回退 Pollinations | Pollinations |
-| 音乐 | `step-music` | 网页版 `music-3.0` / `music-2.6` | `music-3.0-free`（限免，RPM 3）等 | [MiniMax Music 3](https://huggingface.co/spaces/MiniMaxAI/MiniMax-Music3) 公开 Space |
-| 额度 | 账号音乐额度（示例账号 10 次） | 网页账号创作次数 | 官方限免模型，按账号限速 | 匿名约 2 分钟 GPU/天 |
-| 输出 | MP3 · 44.1kHz | MP3 · 44.1kHz | MP3 · 44.1kHz | WAV · 44.1kHz |
-| 实时试听 | 不支持 | 不支持 | 不支持 | 支持，边生成边播放 |
+| | StepFun 阶跃（实验性） | 网页登录态（实验性） | 公益免费 Space |
+| --- | --- | --- | --- |
+| 触发条件 | 填入 www.stepfun.com 的 Oasis-Token | 填入 www.minimax.cn 的登录 Token | 不填（默认） |
+| 写词 | 本地歌词 / Pollinations | 官方歌词接口 / Pollinations | Pollinations |
+| 音乐 | `step-music` | 网页版 `music-3.0` / `music-2.6` | [MiniMax Music 3](https://huggingface.co/spaces/MiniMaxAI/MiniMax-Music3) 公开 Space |
+| 额度 | 账号音乐额度（示例账号 10 次） | 网页账号创作次数 | 匿名约 2 分钟 GPU/天 |
+| 输出 | MP3 · 44.1kHz | MP3 · 44.1kHz | WAV · 44.1kHz |
+| 实时试听 | 不支持 | 不支持 | 支持，边生成边播放 |
 
-优先级：**StepFun > 网页登录态 > 官方 API Key > 公益 Space**。填了多个时按这个顺序走，页面顶部会显示当前实际使用的引擎。
+优先级：**StepFun > 网页登录态 > 公益 Space**。填了多个时按这个顺序走，页面顶部会显示当前实际使用的引擎。
+
+> MiniMax 官方音乐 API 已对**新用户下线**（错误 2153），因此移除了该引擎。网页登录态和 StepFun 不受影响。
 
 ### StepFun 阶跃音乐（实验性）
 
@@ -54,17 +56,6 @@
 - Token 等同于账号登录态，**只在本机使用**；不要把服务开到公网，也不要把 Token 提交到代码仓库。
 - 需要 **Node.js 22+**（用内置 WebSocket）；其它引擎 Node 18+ 即可。
 
-### 官方 MiniMax 接口
-
-- 文档：<https://platform.minimaxi.com/docs/api-reference/music-generation>
-- Key 获取：<https://platform.minimaxi.com/> → 账户管理 → 接口密钥
-- 生成：`POST https://api.minimax.cn/v1/music_generation`
-- 写词：`POST https://api.minimax.cn/v1/lyrics_generation`（`mode: write_full_song`）
-- 模型：默认 `music-3.0-free`；网页里可切换 `music-2.6-free`（限免）、`music-3.0` / `music-2.6`（按量计费），也可以「跟随服务器配置」由 `MINIMAX_MODEL` 决定
-- 纯音乐：`is_instrumental: true`；不写歌词时自动用 `lyrics_optimizer`
-
-Key 只保存在本机浏览器的 localStorage 里，生成时经本机服务转发给 MiniMax，不会写进代码或日志。
-
 ### 公益免费路径
 
 不填任何 Key 时，音乐走 MiniMax 官方 Hugging Face Space，写词走 [Pollinations](https://pollinations.ai) 的匿名文本接口。Hugging Face ZeroGPU 按账号/IP 每天限额：
@@ -96,15 +87,15 @@ Windows 也可以直接双击 `start.bat`，会自动启动并打开浏览器。
 
 ## 功能
 
-- **四种引擎**：StepFun 阶跃 / MiniMax 网页登录态 / MiniMax 官方 API / 公益免费 Space，按优先级自动选择
+- **三种引擎**：StepFun 阶跃 / MiniMax 网页登录态 / 公益免费 Space，按优先级自动选择
 - **简单模式**：一句描述 → AI 写词 → 生成完整歌曲
 - **自定义模式**：自己写歌词（`[Verse]` / `[Chorus]` 分段）+ 风格标签
 - **纯音乐**：跳过人声
 - **实时试听**（仅公益 Space）：生成过程中音频边生成边播放（Web Audio 流式播放 + 可视化）
 - **作品库**：自动保存到 `.cache/audio/`，刷新不丢，可下载 MP3 / WAV
-- 网页/官方引擎会同时保存模型生成的封面图（CDN 地址）
+- 网页引擎会同时保存模型生成的封面图（CDN 地址）
 - 时长 30–180 秒、三档质量（仅公益 Space 生效）
-- 生成失败会给出明确原因（Token 失效、Key 无效、余额不足、限流、额度用完、网络等）
+- 生成失败会给出明确原因（Token 失效、额度用完、网络等）
 
 ## 配置
 
@@ -116,9 +107,6 @@ Windows 也可以直接双击 `start.bat`，会自动启动并打开浏览器。
 | `STEP_TOKEN` | 服务器级 StepFun Oasis-Token（等价于网页里填） | 空 |
 | `MM_WEB_TOKEN` | 服务器级 MiniMax 网页登录态 Token（等价于网页里填） | 空 |
 | `MM_WEB_OP_TICKET` | 网页端的 op_ticket（一般不用填） | 空 |
-| `MINIMAX_API_KEY` | 服务器级 MiniMax Key（等价于网页里填） | 空 |
-| `MINIMAX_MODEL` | 官方默认模型（网页里可覆盖） | `music-3.0-free` |
-| `MINIMAX_BASE` | 官方接口域名 | `https://api.minimax.cn` |
 | `HF_TOKEN` | 公益 Space 的 HF Token（可选） | 空 |
 | `MAX_CONCURRENT` | 同时生成的任务数 | `2` |
 | `ACCESS_PASSWORD` | 公网访问密码（Basic Auth），设置后所有页面/接口都要密码 | 空（不启用） |
@@ -142,16 +130,14 @@ ai-song/
 ## 实现说明
 
 - **公益引擎**：通过 Gradio 的 `studio_generate` 接口，服务端把上游事件流转成 SSE，PCM 块实时推给浏览器用 Web Audio 播放。
-- **官方引擎**：一次性 HTTP 返回（`output_format: url`），后端拿到 24 小时有效的音频 URL 后立刻下载缓存。
 - **网页引擎**：服务端直连 WebSocket，心跳保活，等到 `status=2` 后用历史列表补全 `audio_url` / 时长 / 封面，再下载缓存。
 - **StepFun 引擎**：先刷新 token，再 `SubmitMusicTask` 提交、每 3 秒 `GetMusicTask` 轮询，成功后下载 `audioUrl`。
-- 官方和网页引擎没有流式进度，前端用缓动进度条示意；公益引擎是真实进度。
+- 网页和 StepFun 引擎没有流式进度，前端用缓动进度条示意；公益引擎是真实进度。
 - 上游网络请求优先走 `curl`：国内网络里 Node(OpenSSL) 的 TLS 握手更容易被重置，而 Windows 自带的 curl（Schannel）稳定得多。WebSocket 用 Node 内置实现，直连 `www.minimax.cn`。
 
 ## 说明与限制
 
 - StepFun 和 MiniMax 网页登录态都是**非官方、实验性**能力：可能随时失效，可能不符合网站条款，账号也可能因此受限，请自行判断。
-- 官方限免模型不扣费但限速（RPM 3）；正式模型按 MiniMax 计费。
 - 公益 Space 的匿名额度很小，适合尝鲜；高峰期会排队。
 - 请勿做成公开高并发服务，每一次生成都在真实消耗模型方/账号的算力或次数。
 - 只有本地服务，没有账号体系；如需局域网/公网访问，改 `HOST=0.0.0.0` 并设置 `ACCESS_PASSWORD`（**不要把带网页 Token 的实例无密码暴露到公网**）。

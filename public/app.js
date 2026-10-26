@@ -19,7 +19,6 @@
     durationOut: $('#durationOut'),
     quality: $('#quality'),
     hfToken: $('#hfToken'),
-    minimaxKey: $('#minimaxKey'),
     minimaxModel: $('#minimaxModel'),
     mmWebToken: $('#mmWebToken'),
     stepToken: $('#stepToken'),
@@ -82,7 +81,6 @@
   let seekDragging = false;
   let currentEngine = 'hf';
   let pseudoTimer = null;
-  let serverConfig = null;
 
   /* ------------------------------------------------------------------ *
    * 实时播放：把服务端转发的 PCM 块排队喂给 Web Audio
@@ -187,11 +185,6 @@
     el.panelCustom.classList.toggle('is-hidden', next !== 'custom');
   }
 
-  function hasMinimaxKey() {
-    const k = (el.minimaxKey.value || '').trim();
-    return k.length >= 20 && /^[A-Za-z0-9._-]+$/.test(k);
-  }
-
   function hasWebToken() {
     const t = (el.mmWebToken.value || '').trim();
     return /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(t);
@@ -205,21 +198,16 @@
   function activeEngine() {
     if (hasStepToken()) return 'stepfun';
     if (hasWebToken()) return 'web';
-    if (hasMinimaxKey()) return 'minimax';
     return 'hf';
   }
 
   function webModelLabel() {
-    const m = String(el.minimaxModel?.value || serverConfig?.minimaxModel || 'music-3.0').replace(/-free$/i, '');
+    const m = String(el.minimaxModel?.value || 'music-3.0').replace(/-free$/i, '');
     return ['music-3.0', 'music-2.6'].includes(m) ? m : 'music-3.0';
   }
 
-  const OFFICIAL_MODEL_OPTIONS = [
-    ['', '跟随服务器配置'],
-    ['music-3.0-free', 'music-3.0-free · 限免 RPM 3'],
-    ['music-2.6-free', 'music-2.6-free · 限免 RPM 3'],
-    ['music-3.0', 'music-3.0 · 按量计费'],
-    ['music-2.6', 'music-2.6 · 按量计费'],
+  const HF_MODEL_OPTIONS = [
+    ['', '公益 Space · 固定模型'],
   ];
   const WEB_MODEL_OPTIONS = [
     ['music-3.0', 'music-3.0 · 网页版'],
@@ -232,7 +220,7 @@
   function syncModelOptions(engine) {
     const want = engine === 'web' ? WEB_MODEL_OPTIONS
       : engine === 'stepfun' ? STEPFUN_MODEL_OPTIONS
-        : OFFICIAL_MODEL_OPTIONS;
+        : HF_MODEL_OPTIONS;
     const sig = want.map(x => x[0]).join(',');
     if (el.minimaxModel.dataset.sig === sig) return;
     const current = el.minimaxModel.value;
@@ -241,9 +229,7 @@
     for (const [value, label] of want) {
       const option = document.createElement('option');
       option.value = value;
-      option.textContent = value === '' && serverConfig?.minimaxModel
-        ? `跟随服务器（${serverConfig.minimaxModel}）`
-        : label;
+      option.textContent = label;
       el.minimaxModel.appendChild(option);
     }
     el.minimaxModel.value = want.some(([v]) => v === current) ? current : want[0][0];
@@ -251,29 +237,24 @@
 
   function updateEngineUI() {
     const engine = activeEngine();
-    const model = el.minimaxModel?.value || serverConfig?.minimaxModel || 'music-3.0-free';
-    const free = /-free$/.test(model);
     syncModelOptions(engine);
     if (el.engineNow) {
       if (engine === 'stepfun') {
         el.engineNow.innerHTML = '当前使用：<b>StepFun 阶跃</b> · step-music（消耗账号音乐额度）';
       } else if (engine === 'web') {
         el.engineNow.innerHTML = `当前使用：<b>网页登录态</b> · ${webModelLabel()}（消耗网页创作额度）`;
-      } else if (engine === 'minimax') {
-        el.engineNow.innerHTML = `当前使用：<b>MiniMax 官方接口</b> · ${model}（${free ? '限免，RPM 3' : '按量计费'}）`;
       } else {
         el.engineNow.innerHTML = '当前使用：<b>公益免费 Space</b> · 无需 Key';
       }
     }
-    const fixedLength = engine === 'web' || engine === 'minimax' || engine === 'stepfun';
+    const fixedLength = engine === 'web' || engine === 'stepfun';
     if (el.minimaxModel) el.minimaxModel.disabled = engine === 'hf';
     if (el.durationField) el.durationField.classList.toggle('is-disabled', fixedLength);
     el.duration.disabled = fixedLength;
     el.quality.disabled = fixedLength;
     if (el.durationNote) {
       el.durationNote.textContent = engine === 'stepfun' ? '阶跃按歌词长度决定时长'
-        : engine === 'web' ? '网页版按歌词/描述决定时长'
-          : engine === 'minimax' ? '官方模型按歌词长度决定时长' : '';
+        : engine === 'web' ? '网页版按歌词/描述决定时长' : '';
     }
     if (el.quotaEstimate) el.quotaEstimate.style.display = engine === 'hf' ? '' : 'none';
     if (el.modelTip) {
@@ -281,35 +262,23 @@
         ? '阶跃使用固定模型 step-music，按账号的音乐生成额度计费。'
         : engine === 'web'
           ? '网页登录态使用正式模型，按网页账号的创作次数计费。'
-          : '限免模型不扣费但限速（RPM 3）；付费模型更稳定，按官方价目计费。翻唱模型需要参考音频，暂未接入。';
+          : '公益 Space 固定使用 MiniMax Music 3 公开模型；填入 Token 后会切换可选模型。';
     }
     if (el.modeBadge) {
       el.modeBadge.textContent = engine === 'stepfun' ? 'StepFun 登录态'
-        : engine === 'web' ? '网页登录态'
-          : engine === 'minimax' ? '官方接口' : '免登录 · 免费';
+        : engine === 'web' ? '网页登录态' : '免登录 · 免费';
     }
     const dot = el.engineStatus.querySelector('.dot');
     if (engine !== 'hf') {
       if (dot) dot.className = 'dot ok';
       el.engineText.textContent = engine === 'stepfun' ? 'StepFun 登录态已配置'
-        : engine === 'web' ? '网页登录态已配置' : '官方接口已配置';
+        : '网页登录态已配置';
     } else {
       if (dot) dot.className = 'dot wait';
       el.engineText.textContent = '检测音源…';
       clearTimeout(updateEngineUI._h);
       updateEngineUI._h = setTimeout(checkHealth, 500);
     }
-  }
-
-  async function loadConfig() {
-    try {
-      serverConfig = await (await fetch('/api/config')).json();
-    } catch { serverConfig = null; }
-    if (serverConfig?.minimaxModel && el.minimaxModel) {
-      const opt = el.minimaxModel.querySelector('option[value=""]');
-      if (opt) opt.textContent = `跟随服务器（${serverConfig.minimaxModel}）`;
-    }
-    updateEngineUI();
   }
 
   // 估算本次生成会消耗多少 ZeroGPU 额度（官方 Space 的 get_duration × xlarge 2 倍）
@@ -519,7 +488,7 @@
         const res = await fetch('/api/lyrics', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ description, style: payload.style, instrumental, duration, minimaxKey: el.minimaxKey.value.trim() }),
+          body: JSON.stringify({ description, style: payload.style, instrumental, duration }),
           signal: lyricAbort.signal,
         });
         const data = await res.json().catch(() => ({}));
@@ -558,8 +527,6 @@
   async function startJob(payload) {
     const token = el.hfToken.value.trim();
     if (token) payload.hfToken = token;
-    const mmKey = el.minimaxKey.value.trim();
-    if (mmKey) payload.minimaxKey = mmKey;
     const webToken = el.mmWebToken.value.trim();
     if (webToken) payload.mmWebToken = webToken;
     const stepToken = el.stepToken.value.trim();
@@ -611,12 +578,10 @@
     lastSeq = 0;
     currentEngine = engine || 'hf';
     StreamPlayer.reset();
-    if (currentEngine === 'minimax' || currentEngine === 'web' || currentEngine === 'stepfun') {
+    if (currentEngine === 'web' || currentEngine === 'stepfun') {
       el.liveHint.textContent = currentEngine === 'stepfun'
         ? '阶跃音乐生成中，通常 1~3 分钟，完成后自动保存'
-        : currentEngine === 'web'
-          ? '网页版生成中，通常 3~8 分钟，完成后自动保存'
-          : '官方接口不支持实时回放，完成即可播放';
+        : '网页版生成中，通常 3~8 分钟，完成后自动保存';
       startPseudoProgress();
     } else {
       el.liveHint.textContent = '正在实时演唱，声音会随生成进度播放';
@@ -634,8 +599,7 @@
         if (msg.engine) currentEngine = msg.engine;
         if (msg.message) el.stageText.textContent = msg.message;
         const map = currentEngine === 'stepfun' ? stageSubtitleStepfun
-          : currentEngine === 'web' ? stageSubtitleWeb
-            : currentEngine === 'minimax' ? stageSubtitleMinimax : stageSubtitle;
+          : currentEngine === 'web' ? stageSubtitleWeb : stageSubtitle;
         if (msg.stage && map[msg.stage]) el.stageSub.textContent = map[msg.stage];
         if (typeof msg.progress === 'number') setProgress(msg.progress, msg.seconds);
       } else if (msg.type === 'progress') {
@@ -671,15 +635,6 @@
     done: '完成',
   };
 
-  const stageSubtitleMinimax = {
-    queued: '等待官方接口',
-    submitting: '连接 MiniMax 官方接口',
-    waiting: '官方接口排队中',
-    generating: '官方模型谱曲演唱中，通常 1~3 分钟',
-    downloading: '正在保存音频',
-    done: '完成',
-  };
-
   const stageSubtitleStepfun = {
     queued: '等待阶跃接口',
     submitting: '连接 StepFun 阶跃音乐',
@@ -700,7 +655,7 @@
 
   let lastProgress = 0;
   function setProgress(ratio, seconds) {
-    if (currentEngine === 'minimax' || currentEngine === 'web' || currentEngine === 'stepfun') return; // 无流式进度，交给伪进度
+    if (currentEngine === 'web' || currentEngine === 'stepfun') return; // 无流式进度，交给伪进度
     const pct = Math.max(0, Math.min(1, ratio || 0));
     lastProgress = pct;
     el.barFill.style.width = (pct * 100).toFixed(1) + '%';
@@ -722,8 +677,7 @@
     el.songTitle.textContent = title;
     const fmt = String(meta?.format || (String(meta?.audio || '').endsWith('.mp3') ? 'mp3' : 'wav')).toUpperCase();
     const engineLabel = meta?.engine === 'stepfun' ? 'StepFun 阶跃'
-      : meta?.engine === 'web' ? 'MiniMax 网页'
-        : meta?.engine === 'minimax' ? 'MiniMax 官方' : '公益 Space';
+      : meta?.engine === 'web' ? 'MiniMax 网页' : '公益 Space';
     el.songMeta.textContent = `${meta?.duration || 0} 秒 · ${fmt} · 44.1kHz · ${engineLabel}`;
     el.resultLyrics.textContent = (meta?.lyrics && !/[instrumental]/i.test(meta.lyrics || ''))
       ? meta.lyrics
@@ -954,8 +908,7 @@
     el.songTitle.textContent = item.title || '未命名作品';
     const itemFmt = String(item.format || (String(item.audio || '').endsWith('.mp3') ? 'mp3' : 'wav')).toUpperCase();
     const itemEngine = item.engine === 'stepfun' ? 'StepFun 阶跃'
-      : item.engine === 'web' ? 'MiniMax 网页'
-        : item.engine === 'minimax' ? 'MiniMax 官方' : '公益 Space';
+      : item.engine === 'web' ? 'MiniMax 网页' : '公益 Space';
     el.songMeta.textContent = `${item.duration || 0} 秒 · ${itemFmt} · 44.1kHz · ${itemEngine}`;
     el.resultLyrics.textContent = item.lyrics && !/[instrumental]/i.test(item.lyrics || '') ? item.lyrics : '纯音乐作品，无人声。';
     const [c1, c2] = paletteFor(item.title || '');
@@ -997,12 +950,6 @@
       el.engineText.textContent = '网页登录态已配置';
       return;
     }
-    if (hasMinimaxKey()) {
-      const dot = el.engineStatus.querySelector('.dot');
-      if (dot) dot.className = 'dot ok';
-      el.engineText.textContent = '官方接口已配置';
-      return;
-    }
     try {
       const res = await fetch('/api/health');
       const data = await res.json();
@@ -1038,7 +985,6 @@
         quality: el.quality.value,
         instrumental: el.instrumental.checked,
         hfToken: el.hfToken.value,
-        minimaxKey: el.minimaxKey.value,
         minimaxModel: el.minimaxModel.value,
         mmWebToken: el.mmWebToken.value,
         stepToken: el.stepToken.value,
@@ -1061,7 +1007,6 @@
       if (d.quality) el.quality.value = d.quality;
       el.instrumental.checked = Boolean(d.instrumental);
       el.hfToken.value = d.hfToken || '';
-      el.minimaxKey.value = d.minimaxKey || '';
       el.minimaxModel.value = d.minimaxModel || '';
       el.mmWebToken.value = d.mmWebToken || '';
       el.stepToken.value = d.stepToken || '';
@@ -1101,8 +1046,6 @@
       }
     });
 
-    el.minimaxKey.addEventListener('input', () => { updateEngineUI(); saveDraft(); });
-    el.minimaxKey.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
     el.minimaxModel.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
     el.mmWebToken.addEventListener('input', () => { updateEngineUI(); saveDraft(); });
     el.mmWebToken.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
@@ -1122,7 +1065,6 @@
     loadDraft();
     updateEngineUI();
     updateRangeFill();
-    loadConfig();
     checkHealth();
     setInterval(checkHealth, 60000);
     loadLibrary();
