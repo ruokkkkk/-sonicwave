@@ -29,13 +29,16 @@
 - 鉴权：`Oasis-Token` Cookie，格式是 `<access>...<refresh>`；服务端通过 `/passport/proto.api.passport.v1.PassportService/RefreshToken` 自动续期
 - 固定模型 `step-music`，支持 `instrumental`；歌曲长度由歌词决定
 
-**怎么拿 Token**：登录 <https://www.stepfun.com/studio/audio?tab=music> → DevTools → Application → Cookies → 复制 `Oasis-Token` 的完整值（中间有一个 `...` 分隔两段 JWT），整段粘到网页「接口设置 → StepFun 登录态」。
+**怎么拿 Token**：登录 <https://www.stepfun.com/studio/audio?tab=music> → DevTools → Application → Cookies → 复制 `Oasis-Token` 的完整值（中间有一个 `...` 分隔两段 JWT）。
+
+**多账号**：在「StepFun 登录态」里**每行粘一个**账号的 Oasis-Token。生成时按顺序自动切换，某个账号额度用完或登录失效会自动尝试下一个；点「验证额度」可以查看每个账号剩余次数，刷新后的 Token 会自动回写。
 
 **注意**：
 
 - access token 约 **30 分钟**过期，refresh token 约 30 天；服务端会先刷新，并把刷新后的新 token **自动回写到输入框**。
 - 完整值约 650 个字符，是两段 JWT 用 `...` 连接；只粘其中一段会提示“缺少 access 段”。
-- 会消耗账号的音乐生成额度，生成记录也会出现在阶跃的「我的作品」里。
+- 会消耗账号的音乐生成额度（示例账号 10 次），生成记录也会出现在阶跃的「我的作品」里。
+- 多账号按顺序轮换，不会跨账号共享额度；某个账号额度为 0 时自动跳过。
 - 非官方接口，可能随时失效；自动化使用可能不符合网站条款。
 - 从 Render 海外机房访问 `stepfun.com` 可能较慢或被 WAF 拦截。
 
@@ -83,6 +86,7 @@ Windows 也可以直接双击 `start.bat`，会自动启动并打开浏览器。
 ## 功能
 
 - **两种引擎**：StepFun 阶跃 / MiniMax 网页登录态，页面下拉切换
+- **StepFun 账号池**：多账号每行一个，额度用完/失效自动切换到下一个，支持一键查询剩余额度
 - **简单模式**：一句描述 → AI 写词 → 生成完整歌曲
 - **自定义模式**：自己写歌词（`[Verse]` / `[Chorus]` 分段）+ 风格标签
 - **纯音乐**：跳过人声（两个引擎都支持）

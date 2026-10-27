@@ -97,9 +97,13 @@
       </div>
 
       <div id="stepTokenBox">
-        <label for="stepToken">StepFun 登录态 <span class="muted">实验性</span></label>
-        <input id="stepToken" type="password" autocomplete="off" spellcheck="false" placeholder="eyJ...（Oasis-Token，含 ... 分隔的两段）">
-        <p class="tip"><b class="warn">非官方接口</b>：消耗阶跃账号的音乐额度（当前账号共 10 次）；access token 约 30 分钟过期，过期后重新复制完整的 <code>Oasis-Token</code>（从 www.stepfun.com 的 Cookie 里取）。只在本机使用。</p>
+        <label for="stepTokens">StepFun 登录态 <span class="muted">每行一个账号</span></label>
+        <textarea id="stepTokens" rows="3" maxlength="8000" spellcheck="false" placeholder="eyJ...（access...refresh，一行一个账号）"></textarea>
+        <div class="step-tools">
+          <button type="button" class="ghost-btn" id="stepQuotaBtn">验证额度</button>
+          <span class="muted" id="stepAccountInfo"></span>
+        </div>
+        <p class="tip"><b class="warn">非官方接口</b>：多个账号每行一个，生成时自动按顺序切换，额度用完/登录失效会尝试下一个。access 约 30 分钟、refresh 约 30 天，刷新后的 Token 会自动回写。只在本机使用。</p>
       </div>
 
     </details>

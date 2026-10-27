@@ -874,27 +874,8 @@ async function stepRefresh(parsed) {
 async function runStepfunJob(job) {
   try {
     const input = job.input;
-    const parsed = parseStepToken(job.stepToken);
-    if (!parsed) throw new Error('StepFun 登录态格式不对，请复制完整的 Oasis-Token');
-
-    setStage(job, 'submitting', '正在刷新 StepFun 登录态…');
-    const session = await stepRefresh(parsed);
-    const freshToken = `${session.access}...${session.refresh}`;
-    job.stepToken = freshToken;
-    if (job.stepTokenFromClient) {
-      broadcast(job, { type: 'token', stepToken: freshToken });
-    }
-    const cookie = session.cookie;
-    const appId = session.appId || parsed.appId || 10200;
-
-    try {
-      const quota = await stepPost('/api/audio/capy.audio.v1.AudioService/GetQuota', {}, cookie, 20000, appId);
-      const remaining = Number(quota?.musicQuota?.remainingQuota);
-      if (Number.isFinite(remaining) && remaining <= 0) throw new Error('StepFun 音乐额度已用完');
-    } catch (e) {
-      if (/额度已用完/.test(e.message)) throw e;
-      // 配额接口异常不阻塞提交，交给提交接口报错
-    }
+    const candidates = Array.isArray(job.stepTokens) ? job.stepTokens : [];
+    if (!candidates.length) throw new Error('没有可用的 StepFun 账号');
 
     const caption = [input.style, input.description]
       .filter(Boolean).join('，').replace(/\s+/g, ' ').slice(0, 2000) || 'pop music, warm vocal';
@@ -908,12 +889,62 @@ async function runStepfunJob(job) {
       responseFormat: 'AUDIO_FORMAT_MP3',
     };
 
-    setStage(job, 'submitting', '正在提交到 StepFun 阶跃音乐…');
-    const submit = await stepPost(
-      '/api/audio/capy.audio.v1.AudioService/SubmitMusicTask', body, cookie, 60000, appId
-    );
-    const taskId = submit?.taskId;
-    if (!taskId) throw new Error('StepFun 没有返回任务号');
+    let chosen = null;
+    const notes = [];
+    for (const candidate of candidates) {
+      if (job.canceled) return;
+      const label = `账号 ${candidate.index + 1}`;
+      if (!candidate.parsed || !candidate.parsed.access) {
+        notes.push(`${label}: 登录态不完整`);
+        continue;
+      }
+      setStage(job, 'submitting', `正在尝试 StepFun ${label}/${candidates.length}…`);
+      try {
+        const session = await stepRefresh(candidate.parsed);
+        const appId = session.appId || candidate.parsed.appId || 10200;
+
+        let remaining = null;
+        try {
+          const quota = await stepPost(
+            '/api/audio/capy.audio.v1.AudioService/GetQuota', {}, session.cookie, 20000, appId
+          );
+          remaining = Number(quota?.musicQuota?.remainingQuota);
+        } catch (e) {
+          if (/unauthenticated|token is illegal|signature|401/i.test(e.message)) {
+            notes.push(`${label}: ${friendlyError(e.message)}`);
+            continue;
+          }
+        }
+        if (Number.isFinite(remaining) && remaining <= 0) {
+          notes.push(`${label}: 额度用完`);
+          continue;
+        }
+
+        const submit = await stepPost(
+          '/api/audio/capy.audio.v1.AudioService/SubmitMusicTask', body, session.cookie, 60000, appId
+        );
+        const taskId = submit?.taskId;
+        if (!taskId) throw new Error('没有返回任务号');
+
+        chosen = { candidate, session, appId, taskId };
+        const freshToken = `${session.access}...${session.refresh}`;
+        job.chosenStepToken = freshToken;
+        job.chosenStepTokenIndex = candidate.index;
+        if (!candidate.env) {
+          broadcast(job, { type: 'token', index: candidate.index, stepToken: freshToken });
+        }
+        log(`[${job.id.slice(0, 6)}] 使用 StepFun ${label}（剩余 ${remaining ?? '?'} 次）`);
+        break;
+      } catch (e) {
+        notes.push(`${label}: ${friendlyError(e.message)}`);
+      }
+    }
+    if (!chosen) {
+      throw new Error('所有 StepFun 账号均不可用：' + (notes.join('；') || '没有可用账号'));
+    }
+
+    const { session, appId, taskId } = chosen;
+    const cookie = session.cookie;
 
     setStage(job, 'generating', '阶跃音乐正在谱曲演唱，通常 1~3 分钟…', { progress: 0.1 });
     job.status = 'generating';
@@ -959,6 +990,7 @@ async function runStepfunJob(job) {
       format: 'mp3',
       bytes: stat.size,
       model: STEP_MODEL,
+      stepAccount: chosen.candidate.index + 1,
     });
     await completeJob(job, meta);
   } catch (err) {
@@ -991,7 +1023,7 @@ function setStage(job, stage, message, extra = {}) {
   log(`[${job.id.slice(0, 6)}] ${message}`);
 }
 
-function createJob(input, engine, mmWebToken = '', stepToken = '', minimaxModel = '') {
+function createJob(input, engine, mmWebToken = '', stepTokens = [], minimaxModel = '') {
   const id = crypto.randomBytes(8).toString('hex');
   const job = {
     id,
@@ -1007,7 +1039,7 @@ function createJob(input, engine, mmWebToken = '', stepToken = '', minimaxModel 
     engine,
     minimaxModel,
     mmWebToken,
-    stepToken,
+    stepTokens,
     input,
     audioUrl: null,
     error: null,
@@ -1075,6 +1107,7 @@ function failJob(job, err) {
 
 function friendlyError(msg) {
   if (/StepFun.*(unauthenticated|token is illegal|401)/i.test(msg)) return 'StepFun 登录态已失效，请重新登录 www.stepfun.com 后复制新的 Oasis-Token。';
+  if (/所有 StepFun 账号均不可用/.test(msg)) return msg;
   if (/StepFun 刷新后是游客态/.test(msg)) return 'StepFun 登录态不完整或 refresh 已失效。请重新登录 www.stepfun.com，复制完整的 Oasis-Token（两段 JWT，中间有 ...）。';
   if (/StepFun 登录态不匹配/.test(msg)) return 'StepFun 的 access 与 refresh 不是同一次登录，请重新复制完整的 Oasis-Token。';
   if (/StepFun 登录态已过期/.test(msg)) return 'StepFun 登录态已失效，请重新复制完整的 Oasis-Token（含 access 和 refresh 两段）。';
@@ -1257,6 +1290,39 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (pathname === '/api/stepfun/quota' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const list = Array.isArray(body.tokens) ? body.tokens.slice(0, 5) : [];
+    const results = [];
+    for (let i = 0; i < list.length; i++) {
+      const raw = cleanText(list[i], 4000);
+      const parsed = raw ? parseStepToken(raw) : null;
+      if (!parsed || !parsed.access) {
+        results.push({ index: i, ok: false, error: parsed ? '缺少 access 段' : '格式不对' });
+        continue;
+      }
+      try {
+        const session = await stepRefresh(parsed);
+        const appId = session.appId || parsed.appId || 10200;
+        const quota = await stepPost(
+          '/api/audio/capy.audio.v1.AudioService/GetQuota', {}, session.cookie, 20000, appId
+        );
+        const mq = quota?.musicQuota || {};
+        results.push({
+          index: i,
+          ok: true,
+          remaining: Number(mq.remainingQuota),
+          total: Number(mq.totalQuota),
+          used: Number(mq.usedQuota),
+          stepToken: `${session.access}...${session.refresh}`,
+        });
+      } catch (e) {
+        results.push({ index: i, ok: false, error: friendlyError(e.message) });
+      }
+    }
+    return json(res, 200, { results });
+  }
+
   if (pathname === '/api/lyrics' && req.method === 'POST') {
     const body = await readJsonBody(req);
     const duration = 60;
@@ -1293,26 +1359,36 @@ async function handleApi(req, res, url) {
     let engine = body.engine === 'web' ? 'web' : body.engine === 'stepfun' ? 'stepfun' : '';
     const minimaxModel = cleanText(body.minimaxModel, 40);
     const mmWebToken = pickWebToken(body.mmWebToken);
-    const rawStep = cleanText(body.stepToken, 4000);
-    const parsedStep = rawStep ? parseStepToken(rawStep) : null;
-    const stepToken = rawStep ? (parsedStep ? rawStep : (STEP_TOKEN || '')) : STEP_TOKEN;
-    if (!engine) engine = stepToken ? 'stepfun' : 'web';
+    const rawStepList = Array.isArray(body.stepTokens)
+      ? body.stepTokens
+      : (body.stepToken ? [body.stepToken] : []);
+    const stepCandidates = [];
+    rawStepList.slice(0, 5).forEach((item, index) => {
+      const raw = cleanText(item, 4000);
+      if (!raw) return;
+      stepCandidates.push({ index, raw, parsed: parseStepToken(raw), env: false });
+    });
+    if (!stepCandidates.length && STEP_TOKEN) {
+      stepCandidates.push({ index: 0, raw: STEP_TOKEN, parsed: parseStepToken(STEP_TOKEN), env: true });
+    }
+    if (!engine) engine = stepCandidates.length ? 'stepfun' : 'web';
     if (engine === 'web' && !mmWebToken) {
       return json(res, 400, { error: '请先填入 MiniMax 网页登录态 Token' });
     }
     if (engine === 'stepfun') {
-      if (rawStep && !parsedStep) {
-        return json(res, 400, { error: 'StepFun 登录态格式不对：请粘贴完整的 Oasis-Token（access...refresh 两段）' });
-      }
-      if (stepToken) {
-        const info = parsedStep || parseStepToken(stepToken);
-        if (info && !info.access) {
-          return json(res, 400, { error: 'StepFun 登录态缺少 access 段：请复制完整的 Oasis-Token（中间有 ... 分隔）' });
-        }
-      }
-      if (!stepToken) {
+      if (!stepCandidates.length) {
         return json(res, 400, { error: '请先填入 StepFun 登录态 Token' });
       }
+      const usable = stepCandidates.filter(c => c.parsed && c.parsed.access);
+      if (!usable.length) {
+        const bad = stepCandidates.find(c => !c.parsed);
+        return json(res, 400, {
+          error: bad
+            ? 'StepFun 登录态格式不对：请粘贴完整的 Oasis-Token（access...refresh 两段）'
+            : 'StepFun 登录态缺少 access 段：请复制完整的 Oasis-Token（中间有 ... 分隔）',
+        });
+      }
+      stepCandidates.splice(0, stepCandidates.length, ...usable);
     }
     if (!instrumental && lyrics.length < 10) {
       return json(res, 400, { error: '歌词太短了，至少写几句' });
@@ -1325,8 +1401,7 @@ async function handleApi(req, res, url) {
       duration: 60,
       instrumental,
     };
-    const job = createJob(input, engine, mmWebToken, stepToken, minimaxModel);
-    job.stepTokenFromClient = Boolean(rawStep && parsedStep);
+    const job = createJob(input, engine, mmWebToken, stepCandidates, minimaxModel);
     enqueue(job);
     log(`[${job.id.slice(0, 6)}] 新任务（${job.engine}${job.engine === 'web' ? ' / ' + job.minimaxModel : ''}）：${input.title} / ${input.style}`);
     return json(res, 200, { id: job.id, status: job.status, engine: job.engine });
@@ -1367,8 +1442,8 @@ async function handleApi(req, res, url) {
         type: 'status', stage: job.stage, message: job.message,
         progress: job.progress, status: job.status, engine: job.engine,
       });
-      if (job.engine === 'stepfun' && job.stepTokenFromClient && job.stepToken) {
-        sseSend(res, { type: 'token', stepToken: job.stepToken });
+      if (job.engine === 'stepfun' && job.chosenStepToken) {
+        sseSend(res, { type: 'token', index: job.chosenStepTokenIndex, stepToken: job.chosenStepToken });
       }
       if (job.status === 'done' && job.meta) {
         sseSend(res, { type: 'done', meta: job.meta, audioUrl: job.audioUrl });

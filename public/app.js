@@ -17,7 +17,9 @@
     styleCustom: $('#styleCustom'),
     minimaxModel: $('#minimaxModel'),
     mmWebToken: $('#mmWebToken'),
-    stepToken: $('#stepToken'),
+    stepTokens: $('#stepTokens'),
+    stepQuotaBtn: $('#stepQuotaBtn'),
+    stepAccountInfo: $('#stepAccountInfo'),
     webTokenBox: $('#webTokenBox'),
     stepTokenBox: $('#stepTokenBox'),
     modelTip: $('#modelTip'),
@@ -78,6 +80,7 @@
   let currentEngine = 'stepfun';
   let serverWebToken = false;
   let serverStepToken = false;
+  let sentStepEntries = [];
   let pseudoTimer = null;
 
   /* ------------------------------------------------------------------ *
@@ -112,20 +115,27 @@
     return /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(t);
   }
 
-  function stepTokenInfo() {
-    let raw = (el.stepToken.value || '').trim();
-    if (raw.includes('Oasis-Token=')) {
-      const m = raw.match(/Oasis-Token=([^;\s]+)/);
-      raw = m ? m[1] : '';
-      try { raw = decodeURIComponent(raw); } catch { /* 保持原样 */ }
-    }
-    const parts = raw.split('...');
-    const complete = parts.length === 2 && /^eyJ/.test(parts[0]) && /^eyJ/.test(parts[1]);
-    return { raw, complete };
+  function stepEntries() {
+    const lines = String(el.stepTokens.value || '').split('\n');
+    const entries = [];
+    lines.forEach((line, lineIndex) => {
+      const raw = line.trim();
+      if (!raw) return;
+      let token = raw;
+      if (token.includes('Oasis-Token=')) {
+        const m = token.match(/Oasis-Token=([^;\s]+)/);
+        token = m ? m[1] : '';
+        try { token = decodeURIComponent(token); } catch { /* 保持原样 */ }
+      }
+      const parts = token.split('...');
+      const complete = parts.length === 2 && /^eyJ/.test(parts[0]) && /^eyJ/.test(parts[1]);
+      entries.push({ lineIndex, raw, complete });
+    });
+    return entries;
   }
 
   function hasStepToken() {
-    return stepTokenInfo().complete;
+    return stepEntries().some(e => e.complete);
   }
 
   function stepReady() { return hasStepToken() || serverStepToken; }
@@ -167,15 +177,17 @@
   function updateEngineUI() {
     const engine = activeEngine();
     syncModelOptions(engine);
-    const stepInfo = stepTokenInfo();
-    const stepIncomplete = Boolean(stepInfo.raw) && !stepInfo.complete && !serverStepToken;
-    const ready = engine === 'stepfun' ? stepReady() : webReady();
+    const stepList = stepEntries();
+    const completeStep = stepList.filter(e => e.complete).length;
+    const stepIncomplete = stepList.length > 0 && completeStep === 0 && !serverStepToken;
+    const stepCount = completeStep || (serverStepToken ? 1 : 0);
+    const ready = engine === 'stepfun' ? (completeStep > 0 || serverStepToken) : webReady();
     if (el.engineNow) {
       if (engine === 'stepfun') {
         el.engineNow.innerHTML = ready
-          ? '当前使用：<b>StepFun 阶跃</b> · step-music（消耗账号音乐额度）'
+          ? `当前使用：<b>StepFun 阶跃</b> · step-music（${serverStepToken && !completeStep ? '服务器账号' : stepCount + ' 个账号，自动切换'}）`
           : stepIncomplete
-            ? '当前使用：<b>StepFun 阶跃</b> · Token 不完整（需要 access...refresh 两段）'
+            ? '当前使用：<b>StepFun 阶跃</b> · Token 不完整（每行需要 access...refresh）'
             : '当前使用：<b>StepFun 阶跃</b> · 还没配置登录态';
       } else {
         el.engineNow.innerHTML = ready
@@ -196,7 +208,7 @@
     const bad = engine === 'stepfun' && stepIncomplete;
     if (dot) dot.className = 'dot ' + (ready ? 'ok' : bad ? 'bad' : 'wait');
     el.engineText.textContent = engine === 'stepfun'
-      ? (ready ? 'StepFun 登录态已配置' : bad ? 'StepFun Token 不完整' : '等待填入 StepFun Token')
+      ? (ready ? (serverStepToken && !completeStep ? 'StepFun 服务器账号已配置' : `StepFun ${stepCount} 个账号已配置`) : bad ? 'StepFun Token 不完整' : '等待填入 StepFun Token')
       : (ready ? '网页登录态已配置' : '等待填入网页 Token');
   }
 
@@ -365,9 +377,9 @@
     const instrumental = el.instrumental.checked;
     const engine = activeEngine();
     if (engine === 'stepfun' && !stepReady()) {
-      const info = stepTokenInfo();
-      toast(info.raw
-        ? 'StepFun Token 不完整：需要完整的 Oasis-Token（access...refresh 两段）'
+      const list = stepEntries();
+      toast(list.length
+        ? 'StepFun Token 不完整：每行需要完整的 access...refresh'
         : '先填入 StepFun 登录态 Token');
       el.quotaBox.open = true;
       return;
@@ -446,8 +458,11 @@
     payload.engine = activeEngine();
     const webToken = el.mmWebToken.value.trim();
     if (webToken) payload.mmWebToken = webToken;
-    const stepToken = el.stepToken.value.trim();
-    if (stepToken) payload.stepToken = stepToken;
+    const stepList = stepEntries().filter(e => e.complete);
+    if (payload.engine === 'stepfun' && stepList.length) {
+      sentStepEntries = stepList;
+      payload.stepTokens = stepList.map(e => e.raw);
+    }
     payload.minimaxModel = el.minimaxModel.value || '';
     cancelRequested = false;
     setBusy(true);
@@ -508,9 +523,15 @@
         const map = currentEngine === 'web' ? stageSubtitleWeb : stageSubtitleStepfun;
         if (msg.stage && map[msg.stage]) el.stageSub.textContent = map[msg.stage];
       } else if (msg.type === 'token' && msg.stepToken) {
-        el.stepToken.value = msg.stepToken;
-        saveDraft();
-        updateEngineUI();
+        const idx = Number.isInteger(msg.index) ? msg.index : 0;
+        const entry = sentStepEntries[idx];
+        if (entry) {
+          const lines = el.stepTokens.value.split('\n');
+          lines[entry.lineIndex] = msg.stepToken;
+          el.stepTokens.value = lines.join('\n');
+          saveDraft();
+          updateEngineUI();
+        }
       } else if (msg.type === 'done') {
         es.close();
         if (eventSource === es) eventSource = null;
@@ -823,6 +844,45 @@
    * 草稿保存 & 初始化
    * ------------------------------------------------------------------ */
   const DRAFT_KEY = 'sonicwave.draft.v1';
+  async function checkStepQuota() {
+    const entries = stepEntries().filter(e => e.complete);
+    if (!entries.length) {
+      toast('先填入至少一个完整的 Oasis-Token');
+      return;
+    }
+    el.stepQuotaBtn.disabled = true;
+    try {
+      const res = await fetch('/api/stepfun/quota', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tokens: entries.map(e => e.raw) }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '查询失败');
+      const results = Array.isArray(data.results) ? data.results : [];
+      const lines = el.stepTokens.value.split('\n');
+      const parts = [];
+      for (const r of results) {
+        const entry = entries[r.index];
+        if (r.ok) {
+          parts.push(`账号 ${r.index + 1}: 剩 ${r.remaining}/${r.total}`);
+          if (entry && r.stepToken) lines[entry.lineIndex] = r.stepToken;
+        } else {
+          parts.push(`账号 ${r.index + 1}: ${r.error || '不可用'}`);
+        }
+      }
+      el.stepTokens.value = lines.join('\n');
+      el.stepAccountInfo.textContent = parts.join(' · ');
+      saveDraft();
+      updateEngineUI();
+      toast('额度已更新');
+    } catch (e) {
+      toast(e.message);
+    } finally {
+      el.stepQuotaBtn.disabled = false;
+    }
+  }
+
   function saveDraft() {
     try {
       localStorage.setItem(DRAFT_KEY, JSON.stringify({
@@ -836,7 +896,7 @@
         engine: el.engineSelect.value,
         minimaxModel: el.minimaxModel.value,
         mmWebToken: el.mmWebToken.value,
-        stepToken: el.stepToken.value,
+        stepTokens: el.stepTokens.value,
       }));
     } catch { /* 隐私模式忽略 */ }
   }
@@ -856,7 +916,7 @@
       if (d.engine === 'web' || d.engine === 'stepfun') el.engineSelect.value = d.engine;
       el.minimaxModel.value = d.minimaxModel || '';
       el.mmWebToken.value = d.mmWebToken || '';
-      el.stepToken.value = d.stepToken || '';
+      el.stepTokens.value = d.stepTokens || d.stepToken || '';
     } catch { /* 忽略损坏草稿 */ }
   }
 
@@ -895,10 +955,11 @@
     el.minimaxModel.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
     el.mmWebToken.addEventListener('input', () => { updateEngineUI(); saveDraft(); });
     el.mmWebToken.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
-    el.stepToken.addEventListener('input', () => { updateEngineUI(); saveDraft(); });
-    el.stepToken.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
+    el.stepTokens.addEventListener('input', () => { el.stepAccountInfo.textContent = ''; updateEngineUI(); saveDraft(); });
+    el.stepTokens.addEventListener('change', () => { updateEngineUI(); saveDraft(); });
+    el.stepQuotaBtn.addEventListener('click', checkStepQuota);
 
-    for (const input of [el.desc, el.styleSimple, el.title, el.lyrics, el.styleCustom, el.minimaxModel, el.mmWebToken, el.stepToken]) {
+    for (const input of [el.desc, el.styleSimple, el.title, el.lyrics, el.styleCustom, el.minimaxModel, el.mmWebToken, el.stepTokens]) {
       input.addEventListener('input', saveDraft);
       input.addEventListener('change', saveDraft);
     }

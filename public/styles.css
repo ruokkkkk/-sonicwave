@@ -727,3 +727,7 @@ footer a:hover { color: var(--a2); }
 .cover.has-art { background-size: cover; background-position: center; }
 .cover.has-art span { opacity: 0; }
 .song-card .mini.has-art { background-size: cover; background-position: center; }
+
+.step-tools { display: flex; align-items: center; gap: 10px; margin: 8px 2px 0; flex-wrap: wrap; }
+.step-tools .ghost-btn { padding: 5px 11px; font-size: 12px; }
+.step-tools .muted { font-size: 11.5px; }
