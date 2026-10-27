@@ -181,12 +181,13 @@ label {
 label:first-child { margin-top: 0; }
 .muted { color: var(--muted-2); font-size: 11.5px; }
 
-textarea, input[type="text"], input:not([type]), select {
+textarea, input[type="text"], input[type="password"], input[type="search"], input:not([type]), select {
   width: 100%;
   background: rgba(8, 8, 13, .62);
   border: 1px solid var(--line);
   border-radius: 13px;
   color: var(--text);
+  caret-color: var(--a2);
   font: inherit;
   font-size: 14px;
   padding: 12px 13px;
@@ -198,7 +199,8 @@ textarea::placeholder, input::placeholder { color: #5f5a70; }
 textarea:focus, input:focus, select:focus {
   border-color: rgba(244, 114, 182, .55);
   box-shadow: 0 0 0 3px rgba(244, 114, 182, .12);
-  background: rgba(10, 10, 16, .85);
+  background: rgba(20, 20, 31, .92);
+  color: var(--text);
 }
 select { appearance: none; cursor: pointer; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: calc(100% - 17px) 50%, calc(100% - 12px) 50%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
 
